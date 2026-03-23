@@ -1,0 +1,28 @@
+{
+    "name": "backend",
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+        "start": "node server.js"
+    },
+    "dependencies": {
+        "@google-cloud/storage": "^7.19.0",
+        "@google-cloud/vision": "^5.3.4",
+        "@napi-rs/canvas": "^0.1.94",
+        "cors": "^2.8.6",
+        "dotenv": "^17.3.1",
+        "express": "^4.22.1",
+        "express-rate-limit": "^8.2.1",
+        "firebase": "^12.10.0",
+        "firebase-admin": "^13.7.0",
+        "groq-sdk": "^0.37.0",
+        "linkedin-jobs-api": "^1.0.7",
+        "mongodb": "^7.1.0",
+        "multer": "^2.0.2",
+        "node-cron": "^4.2.1",
+        "node-fetch": "^3.3.2",
+        "rss-parser": "^3.13.0",
+        "tesseract.js": "^4.1.4",
+        "unpdf": "^1.4.0"
+    }
+}
