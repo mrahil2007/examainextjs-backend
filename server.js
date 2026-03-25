@@ -129,7 +129,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-app.use(express.json({ limit: "10kb" }));
+app.use(express.json({ limit: "15mb" }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const apiLimiter = rateLimit({
@@ -162,7 +162,7 @@ app.use("/quiz/generate", quizLimiter);
 
 const parsedUploadMb = Number(process.env.MAX_UPLOAD_MB);
 const MAX_UPLOAD_MB =
-  Number.isFinite(parsedUploadMb) && parsedUploadMb > 0 ? parsedUploadMb : 10;
+  Number.isFinite(parsedUploadMb) && parsedUploadMb > 0 ? parsedUploadMb : 25;
 const upload = multer({ limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 } });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const infipApiKey = process.env.INFIP_API_KEY || "";
@@ -1800,7 +1800,7 @@ app.post("/image/edit", upload.single("image"), async (req, res) => {
 const cleanPdfText = (text) => {
   if (!text) return "";
 
-  const lines = text.split('\n');
+  const lines = text.split("\n");
   const cleanedLines = [];
   let consecutiveBlankLines = 0;
 
@@ -1823,7 +1823,7 @@ const cleanPdfText = (text) => {
     }
   }
 
-  return cleanedLines.join('\n').trim();
+  return cleanedLines.join("\n").trim();
 };
 
 // ✅ FIX 2+3: /image — PDF handled properly; images use new callVisionAI()
