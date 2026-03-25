@@ -88,22 +88,46 @@ export const sendPushNotification = async (
 const app = express();
 app.set("trust proxy", 1);
 
-// ✅ FIX 1: Added OPTIONS to methods + allowedHeaders + preflight handler
-const CORS_ORIGINS = [
+const DEFAULT_CORS_ORIGINS = [
   "https://examai-in.com",
   "https://www.examai-in.com",
+  "https://api.examai-in.com",
   "https://ai-exam-tutor-ten.vercel.app",
+  "http://localhost:3000",
   "http://localhost:5173",
+  "http://127.0.0.1:5173",
   "http://10.0.2.2:5050",
 ];
+const ENV_CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const CORS_ORIGINS = new Set([...DEFAULT_CORS_ORIGINS, ...ENV_CORS_ORIGINS]);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (CORS_ORIGINS.has(origin)) return true;
+  try {
+    const parsed = new URL(origin);
+    if (parsed.protocol !== "https:") return false;
+    return (
+      parsed.hostname === "examai-in.com" ||
+      parsed.hostname.endsWith(".examai-in.com")
+    );
+  } catch {
+    return false;
+  }
+};
+
 const corsOptions = {
-  origin: CORS_ORIGINS,
+  origin: (origin, callback) => callback(null, isAllowedOrigin(origin)),
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
+  optionsSuccessStatus: 204,
 };
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // ✅ Handle all preflight requests
+app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "10kb" }));
 
@@ -136,7 +160,10 @@ app.use("/chart/generate", aiLimiter);
 app.use("/image", aiLimiter);
 app.use("/quiz/generate", quizLimiter);
 
-const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
+const parsedUploadMb = Number(process.env.MAX_UPLOAD_MB);
+const MAX_UPLOAD_MB =
+  Number.isFinite(parsedUploadMb) && parsedUploadMb > 0 ? parsedUploadMb : 10;
+const upload = multer({ limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 } });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const infipApiKey = process.env.INFIP_API_KEY || "";
 if (!infipApiKey)
@@ -1780,7 +1807,7 @@ app.post("/image", upload.single("image"), async (req, res) => {
     // ── PDF path ──────────────────────────────────────────────────────────────
     if (safeMime === "application/pdf") {
       try {
-        const { text } = await extractText(req.file.buffer);
+        const { text } = await extractText(new Uint8Array(req.file.buffer));
         req.file.buffer = null;
         if (text && text.trim().length > 50) {
           const answer = await askAI(text, req.body.exam);
@@ -1911,9 +1938,9 @@ app.delete("/user/:userId/delete-data", async (req, res) => {
 app.use((req, res) => res.status(404).json({ error: "Route not found" }));
 app.use((err, req, res, next) => {
   if (err.code === "LIMIT_FILE_SIZE")
-    return res
-      .status(413)
-      .json({ error: "File too large. Maximum allowed size is 5MB." });
+    return res.status(413).json({
+      error: `File too large. Maximum allowed size is ${MAX_UPLOAD_MB}MB.`,
+    });
   console.error("❌ Server error:", err.message);
   res.status(500).json({ error: "Internal server error" });
 });
