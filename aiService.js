@@ -265,8 +265,8 @@ const callGemini = async (contents, exam, isVision = false, memory = []) => {
 
 // ── GROQ FALLBACK ─────────────────────────────────────────────────────────────
 const GROQ_CHAT_MODELS = [
-  "meta-llama/llama-4-scout-17b-16e-instruct",
-  "meta-llama/llama-4-scout-17b-16e-instruct",
+  "openai/gpt-oss-120b",
+  "llama-3.1-8b-instant",
   "llama-3.3-70b-versatile",
 ];
 
@@ -320,7 +320,7 @@ const callGroqVisionFallback = async (fileBuffer, mimeType, exam) => {
   const base64Url = `data:${mimeType};base64,${fileBuffer.toString("base64")}`;
 
   const completion = await groq.chat.completions.create({
-    model: "meta-llama/llama-4-scout-17b-16e-instruct",
+    model: "openai/gpt-oss-120b",
     messages: [
       {
         role: "user",
