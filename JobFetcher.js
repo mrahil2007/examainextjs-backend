@@ -4,6 +4,8 @@
 
 import Parser from "rss-parser";
 import cron from "node-cron";
+import fetch from 'node-fetch';
+import mongoose from 'mongoose';
 import admin from "firebase-admin";
 
 // ── Firebase Admin (FCM) ──────────────────────────────────────────────────────

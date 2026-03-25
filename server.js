@@ -13,7 +13,7 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import { extractText } from "unpdf";
+import { extractText, getDocumentProxy } from "unpdf";
 import {
   askAI,
   askAIWithImage,
@@ -1797,6 +1797,35 @@ app.post("/image/edit", upload.single("image"), async (req, res) => {
   }
 });
 
+const cleanPdfText = (text) => {
+  if (!text) return "";
+
+  const lines = text.split('\n');
+  const cleanedLines = [];
+  let consecutiveBlankLines = 0;
+
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+
+    // Skip lines that look like page numbers
+    if (/^(\d+|page\s+\d+)$/i.test(trimmedLine)) {
+      continue;
+    }
+
+    if (trimmedLine === "") {
+      consecutiveBlankLines++;
+      if (consecutiveBlankLines < 2) {
+        cleanedLines.push(trimmedLine);
+      }
+    } else {
+      consecutiveBlankLines = 0;
+      cleanedLines.push(line); // Push the original line to preserve indentation
+    }
+  }
+
+  return cleanedLines.join('\n').trim();
+};
+
 // ✅ FIX 2+3: /image — PDF handled properly; images use new callVisionAI()
 app.post("/image", upload.single("image"), async (req, res) => {
   try {
@@ -1807,10 +1836,12 @@ app.post("/image", upload.single("image"), async (req, res) => {
     // ── PDF path ──────────────────────────────────────────────────────────────
     if (safeMime === "application/pdf") {
       try {
-        const { text } = await extractText(new Uint8Array(req.file.buffer));
+        const pdf = await getDocumentProxy(new Uint8Array(req.file.buffer));
+        const { text } = await extractText(pdf, { mergePages: true });
         req.file.buffer = null;
-        if (text && text.trim().length > 50) {
-          const answer = await askAI(text, req.body.exam);
+        const cleanedText = cleanPdfText(text);
+        if (cleanedText && cleanedText.length > 50) {
+          const answer = await askAI(cleanedText, req.body.exam);
           return res.json({ answer });
         }
         // PDF had no extractable text (scanned) — cannot use vision for PDFs
@@ -1827,7 +1858,6 @@ app.post("/image", upload.single("image"), async (req, res) => {
         });
       }
     }
-
     // ── Image path ────────────────────────────────────────────────────────────
     if (!SUPPORTED_VISION_MIMES.includes(safeMime)) {
       req.file.buffer = null;
