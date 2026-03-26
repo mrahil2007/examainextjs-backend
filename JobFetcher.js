@@ -1261,7 +1261,7 @@ export const startJobCron = async (getJobs, getUsers) => {
   try {
     await getJobs().createIndex(
       { title: 1, organization: 1 },
-      { unique: true, partialFilterExpression: { _isMeta: { $exists: false } } }
+      { unique: true, partialFilterExpression: { source: { $exists: true } } }
     );
     console.log("✅ Jobs unique index (title+organization) ensured");
   } catch (err) {
