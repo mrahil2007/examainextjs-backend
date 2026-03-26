@@ -364,7 +364,12 @@ const fetchFromRSS = async (source, getJobs) => {
       }
       if (item.title.trim().length < 15) continue;
 
-      const exists = await getJobs().findOne({ applyLink: item.link });
+      const exists = await getJobs().findOne({
+        $or: [
+          { applyLink: item.link },
+          { title: item.title.trim(), organization: source.organization },
+        ],
+      });
       if (exists) continue;
 
       const combined = `${item.title} ${item.description || ""}`;
@@ -393,8 +398,12 @@ const fetchFromRSS = async (source, getJobs) => {
         isNew: true,
       };
 
-      await getJobs().insertOne(job);
-      newCount++;
+      try {
+        await getJobs().insertOne(job);
+        newCount++;
+      } catch (e) {
+        if (e.code !== 11000) throw e; // ignore duplicate key, rethrow others
+      }
     }
 
     console.log(
@@ -1039,7 +1048,13 @@ const fetchFromAdzuna = async (getJobs) => {
         if (SKIP_TITLES.some((bad) => titleLower.includes(bad))) continue;
 
         const exists = await getJobs().findOne({
-          applyLink: item.redirect_url,
+          $or: [
+            { applyLink: item.redirect_url },
+            {
+              title: item.title.trim(),
+              organization: item.company?.display_name || "Indian Company",
+            },
+          ],
         });
         if (exists) continue;
 
@@ -1069,8 +1084,12 @@ const fetchFromAdzuna = async (getJobs) => {
           isNew: true,
         };
 
-        await getJobs().insertOne(job);
-        newCount++;
+        try {
+          await getJobs().insertOne(job);
+          newCount++;
+        } catch (e) {
+          if (e.code !== 11000) throw e; // ignore duplicate key, rethrow others
+        }
       }
 
       console.log(`✅ Adzuna [${q.label}]: ${results.length} fetched`);
@@ -1093,7 +1112,7 @@ const markOldJobs = async (getJobs) => {
   );
 };
 
-// ── Cleanup: remove junk + keep only latest 2000 ─────────────────────────────
+// ── Cleanup: remove junk + deduplicate + keep only latest 2000 ───────────────
 const cleanupJobs = async (getJobs) => {
   try {
     const skipRegex = SKIP_TITLES.join("|");
@@ -1105,6 +1124,9 @@ const cleanupJobs = async (getJobs) => {
   } catch (err) {
     console.warn("⚠️ Junk cleanup failed:", err.message);
   }
+
+  // Remove duplicates (same title + organization), keep the oldest entry
+  await deduplicateJobs(getJobs);
 
   try {
     const keepIds = await getJobs()
@@ -1198,7 +1220,54 @@ export const runJobFetcher = async (getJobs, getUsers) => {
 };
 
 // ── Cron: once daily at 6:00 PM IST (12:30 UTC) ──────────────────────────────
-export const startJobCron = (getJobs, getUsers) => {
+// ── Remove all duplicate jobs (same title + organization), keep oldest ───────
+const deduplicateJobs = async (getJobs) => {
+  try {
+    const dupes = await getJobs()
+      .aggregate([
+        { $match: { _isMeta: { $exists: false } } },
+        {
+          $group: {
+            _id: { title: "$title", organization: "$organization" },
+            ids: { $push: "$_id" },
+            count: { $sum: 1 },
+          },
+        },
+        { $match: { count: { $gt: 1 } } },
+      ])
+      .toArray();
+
+    let dupCount = 0;
+    for (const group of dupes) {
+      const idsToDelete = group.ids.slice(1);
+      const res = await getJobs().deleteMany({ _id: { $in: idsToDelete } });
+      dupCount += res.deletedCount;
+    }
+    if (dupCount > 0)
+      console.log(`🧹 Startup: removed ${dupCount} duplicate jobs`);
+    else console.log("✅ No duplicate jobs found");
+    return dupCount;
+  } catch (err) {
+    console.warn("⚠️ Startup dedup failed:", err.message);
+    return 0;
+  }
+};
+
+export const startJobCron = async (getJobs, getUsers) => {
+  // Step 1: Clean existing duplicates FIRST (so unique index can be created)
+  await deduplicateJobs(getJobs);
+
+  // Step 2: Ensure compound unique index to prevent future duplicates at DB level
+  try {
+    await getJobs().createIndex(
+      { title: 1, organization: 1 },
+      { unique: true, partialFilterExpression: { _isMeta: { $exists: false } } }
+    );
+    console.log("✅ Jobs unique index (title+organization) ensured");
+  } catch (err) {
+    console.warn("⚠️ Jobs index creation skipped:", err.message);
+  }
+
   cron.schedule(
     "30 12 * * *",
     async () => {

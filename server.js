@@ -13,7 +13,7 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import { extractText, getDocumentProxy } from "unpdf";
+import { extractText } from "unpdf";
 import {
   askAI,
   askAIWithImage,
@@ -88,48 +88,19 @@ export const sendPushNotification = async (
 const app = express();
 app.set("trust proxy", 1);
 
-const DEFAULT_CORS_ORIGINS = [
-  "https://examai-in.com",
-  "https://www.examai-in.com",
-  "https://api.examai-in.com",
-  "https://ai-exam-tutor-ten.vercel.app",
-  "http://localhost:3000",
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  "http://10.0.2.2:5050",
-];
-const ENV_CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-const CORS_ORIGINS = new Set([...DEFAULT_CORS_ORIGINS, ...ENV_CORS_ORIGINS]);
-
-const isAllowedOrigin = (origin) => {
-  if (!origin) return true;
-  if (CORS_ORIGINS.has(origin)) return true;
-  try {
-    const parsed = new URL(origin);
-    if (parsed.protocol !== "https:") return false;
-    return (
-      parsed.hostname === "examai-in.com" ||
-      parsed.hostname.endsWith(".examai-in.com")
-    );
-  } catch {
-    return false;
-  }
-};
-
-const corsOptions = {
-  origin: (origin, callback) => callback(null, isAllowedOrigin(origin)),
-  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true,
-  optionsSuccessStatus: 204,
-};
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
-
-app.use(express.json({ limit: "15mb" }));
+app.use(
+  cors({
+    origin: [
+      "https://examai-in.com",
+      "https://www.examai-in.com",
+      "https://ai-exam-tutor-ten.vercel.app",
+      "http://localhost:5173",
+      "http://10.0.2.2:5050",
+    ],
+    methods: ["GET", "POST", "PATCH", "DELETE"],
+  })
+);
+app.use(express.json({ limit: "10kb" }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const apiLimiter = rateLimit({
@@ -160,10 +131,7 @@ app.use("/chart/generate", aiLimiter);
 app.use("/image", aiLimiter);
 app.use("/quiz/generate", quizLimiter);
 
-const parsedUploadMb = Number(process.env.MAX_UPLOAD_MB);
-const MAX_UPLOAD_MB =
-  Number.isFinite(parsedUploadMb) && parsedUploadMb > 0 ? parsedUploadMb : 25;
-const upload = multer({ limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 } });
+const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const infipApiKey = process.env.INFIP_API_KEY || "";
 if (!infipApiKey)
@@ -182,6 +150,8 @@ async function connectDB() {
   await db
     .collection("quiz_results")
     .createIndex({ userId: 1, exam: 1, topic: 1, quizId: 1 });
+  // Leaderboard index
+  await db.collection("users").createIndex({ exam: 1, coins: -1 });
   console.log("✅ MongoDB connected");
 }
 
@@ -489,172 +459,6 @@ const callGeminiOnce = async (prompt, maxOutputTokens = 3000) => {
   return null;
 };
 
-// ✅ FIX 2: Vision AI helper — correct MIME handling + Groq vision string format
-// Gemini Vision: supports image/* via inline base64
-// Groq Vision: llama-3.2-11b-vision-preview — content MUST be an array with
-//   image_url objects (base64 data URI). The model supports jpg/png/webp only.
-const SUPPORTED_VISION_MIMES = [
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-  "image/gif",
-];
-
-/**
- * Normalise whatever multer gives us into a concrete MIME type.
- * multer sometimes sets "image/*" for unknown uploads — we sniff the buffer
- * header bytes instead so Gemini/Groq never see a wildcard.
- */
-const normalizeMimeType = (buffer, declaredMime) => {
-  if (
-    declaredMime &&
-    declaredMime !== "image/*" &&
-    declaredMime !== "application/octet-stream"
-  ) {
-    return declaredMime;
-  }
-  // Sniff magic bytes
-  if (buffer[0] === 0xff && buffer[1] === 0xd8) return "image/jpeg";
-  if (buffer[0] === 0x89 && buffer[1] === 0x50) return "image/png";
-  if (buffer[0] === 0x52 && buffer[1] === 0x49) return "image/webp";
-  if (buffer[0] === 0x47 && buffer[1] === 0x49) return "image/gif";
-  if (buffer[0] === 0x25 && buffer[1] === 0x50) return "application/pdf";
-  return "image/jpeg"; // safe default
-};
-
-/**
- * Vision AI: Gemini first, then Groq vision fallback.
- * Both receive a properly typed base64 image — never application/pdf or image/*.
- */
-const callVisionAI = async (buffer, mimetype, exam = "General") => {
-  const safeMime = normalizeMimeType(buffer, mimetype);
-
-  if (!SUPPORTED_VISION_MIMES.includes(safeMime)) {
-    throw new Error(`Unsupported image type for vision: ${safeMime}`);
-  }
-
-  const base64 = buffer.toString("base64");
-  const prompt = `You are an expert tutor for Indian competitive exams (${exam}).
-Analyse this image carefully. If it contains a question, solve it step by step.
-If it contains a diagram, table, or text — explain its exam relevance.
-Provide a clear, detailed answer in the same language as the content.`;
-
-  // ── Gemini Vision ──────────────────────────────────────────────────────────
-  for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
-    const key = getNextGeminiKey();
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  {
-                    inline_data: {
-                      mime_type: safeMime, // ✅ always a concrete MIME now
-                      data: base64,
-                    },
-                  },
-                  { text: prompt },
-                ],
-              },
-            ],
-            generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
-          }),
-        }
-      );
-
-      if (response.status === 429) {
-        console.warn(`⚠️ Gemini Vision key ${attempt + 1} rate limited`);
-        continue;
-      }
-      if (!response.ok) {
-        const errBody = await response.json().catch(() => ({}));
-        console.warn(
-          `⚠️ Gemini Vision key ${attempt + 1} HTTP ${response.status}:`,
-          errBody?.error?.message
-        );
-        continue;
-      }
-
-      const data = await response.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-      if (text) {
-        console.log(`✅ Gemini Vision key ${attempt + 1} succeeded`);
-        return text;
-      }
-    } catch (err) {
-      console.warn(`⚠️ Gemini Vision key ${attempt + 1} error:`, err.message);
-    }
-  }
-
-  // ── Groq Vision fallback ───────────────────────────────────────────────────
-  // ✅ FIX 3: Groq vision requires content as an ARRAY, not a plain string.
-  //    The previous code was passing content as a string → 400 error.
-  //    llama-3.2-11b-vision-preview supports the OpenAI vision array format.
-  console.warn("⚠️ Gemini Vision failed — falling back to Groq Vision");
-  try {
-    const dataUri = `data:${safeMime};base64,${base64}`;
-    const response = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "meta-llama/llama-4-scout-17b-16e-instruct", // ✅ best Groq vision model
-          messages: [
-            {
-              role: "user",
-              // ✅ content MUST be an array for vision models — not a plain string
-              content: [
-                {
-                  type: "image_url",
-                  image_url: { url: dataUri },
-                },
-                {
-                  type: "text",
-                  text: prompt,
-                },
-              ],
-            },
-          ],
-          temperature: 0.2,
-          max_tokens: 2048,
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errBody = await response.json().catch(() => ({}));
-      console.error(
-        "⚠️ Groq Vision fallback failed:",
-        response.status,
-        JSON.stringify(errBody)
-      );
-      throw new Error(
-        `Groq Vision ${response.status}: ${errBody?.error?.message}`
-      );
-    }
-
-    const data = await response.json();
-    const text = data.choices?.[0]?.message?.content?.trim();
-    if (text) {
-      console.log("✅ Groq Vision fallback succeeded");
-      return text;
-    }
-    throw new Error("Groq Vision returned empty content");
-  } catch (err) {
-    throw new Error(`All vision models failed: ${err.message}`);
-  }
-};
-
-// ✅ Sanitizes control characters that break JSON.parse
 const sanitizeJSON = (text) => {
   const start = text.indexOf("[");
   const end = text.lastIndexOf("]");
@@ -833,13 +637,11 @@ const uploadImageForI2I = async (buffer, mimetype) => {
   return null;
 };
 
-// ✅ FIX 4: infipEdit — normalize MIME before building data URI for i2i
 const infipEdit = async (buffer, mimetype, prompt, { width, height } = {}) => {
   if (!infipApiKey) throw new Error("INFIP_API_KEY not set in .env");
-  const safeMime = normalizeMimeType(buffer, mimetype); // ✅ never passes image/*
   const aspect = aspectFromDimensions(width, height);
-  const richPrompt = await buildImageEditPrompt(buffer, safeMime, prompt);
-  const base64DataUrl = `data:${safeMime};base64,${buffer.toString("base64")}`;
+  const richPrompt = await buildImageEditPrompt(buffer, mimetype, prompt);
+  const base64DataUrl = `data:${mimetype};base64,${buffer.toString("base64")}`;
   try {
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), 90000);
@@ -857,7 +659,7 @@ const infipEdit = async (buffer, mimetype, prompt, { width, height } = {}) => {
         response_format: "url",
         images: [base64DataUrl],
       }),
-      signal: ctrl.signal,
+      signal: ctrl,
     });
     clearTimeout(tid);
     if (r.ok) {
@@ -872,7 +674,7 @@ const infipEdit = async (buffer, mimetype, prompt, { width, height } = {}) => {
           mode: "image_to_image",
         };
     }
-    const publicUrl = await uploadImageForI2I(buffer, safeMime);
+    const publicUrl = await uploadImageForI2I(buffer, mimetype);
     if (publicUrl) {
       const ctrl2 = new AbortController();
       const tid2 = setTimeout(() => ctrl2.abort(), 90000);
@@ -1071,6 +873,22 @@ app.get("/mobile/config", (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// COINS HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+const calculateCoins = (score, total, timeTaken, streak) => {
+  const baseCoins = score * 10; // +10 per correct
+  const wrongDeduction = (total - score) * 3; // -3 per wrong
+  const speedBonus = timeTaken < 60 ? 20 : timeTaken < 120 ? 10 : 0; // fast = bonus
+  const streakBonus = streak >= 7 ? 30 : streak >= 3 ? 15 : 0; // streak bonus
+  const perfectBonus = score === total ? 50 : 0; // perfect score bonus
+  return Math.max(
+    0,
+    baseCoins - wrongDeduction + speedBonus + streakBonus + perfectBonus
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // CURRENT AFFAIRS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1178,7 +996,7 @@ const fetchAndStoreRawNews = async () => {
       { $set: { date: today, items: capped, fetchedAt: new Date() } },
       { upsert: true }
     );
-  console.log(`[RAW] ✅ Stored ${capped.length} headlines`);
+  console.log(`[RAW] ✅ Stored ${capped.length} headlines — 0 API cost`);
 };
 
 const buildEnglishPrompt = (headlines, exam, today) =>
@@ -1525,7 +1343,16 @@ app.post("/user/sync", async (req, res) => {
   try {
     await getUsers().updateOne(
       { userId },
-      { $set: { userName, exam, updatedAt: new Date() }, $inc: { xp } },
+      {
+        $set: { userName, exam, updatedAt: new Date() },
+        $inc: { xp },
+        $setOnInsert: {
+          coins: 0,
+          streak: 0,
+          lastPlayedDate: null,
+          createdAt: new Date(),
+        },
+      },
       { upsert: true }
     );
     res.json({ success: true });
@@ -1634,10 +1461,45 @@ app.post("/quiz/generate", async (req, res) => {
   }
 });
 
+// ── Quiz Result — now calculates coins + streak ───────────────────────────────
 app.post("/quiz/result", async (req, res) => {
   const { userId, topic, exam, score, total, timeTaken, quizId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   try {
+    // Load current user for streak calculation
+    const user = await getUsers().findOne({ userId });
+    const today = new Date().toISOString().split("T")[0];
+    const lastPlayed = user?.lastPlayedDate;
+    const yesterday = new Date(Date.now() - 86400000)
+      .toISOString()
+      .split("T")[0];
+
+    // Streak logic: same day = keep, yesterday = increment, else reset to 1
+    const newStreak =
+      lastPlayed === today
+        ? user?.streak || 1
+        : lastPlayed === yesterday
+        ? (user?.streak || 0) + 1
+        : 1;
+
+    const coinsEarned = calculateCoins(score, total, timeTaken, newStreak);
+
+    // Update user coins + streak atomically
+    await getUsers().updateOne(
+      { userId },
+      {
+        $inc: { coins: coinsEarned },
+        $set: {
+          streak: newStreak,
+          lastPlayedDate: today,
+          updatedAt: new Date(),
+        },
+        $setOnInsert: { createdAt: new Date() },
+      },
+      { upsert: true }
+    );
+
+    // Save result record
     await getQuizResults().insertOne({
       userId,
       topic,
@@ -1646,11 +1508,21 @@ app.post("/quiz/result", async (req, res) => {
       total,
       percentage: Math.round((score / total) * 100),
       timeTaken,
+      coinsEarned,
       quizId: quizId ? new ObjectId(quizId) : null,
       createdAt: new Date(),
     });
-    res.json({ success: true });
-  } catch {
+
+    // Return updated stats to client
+    const updatedUser = await getUsers().findOne({ userId });
+    res.json({
+      success: true,
+      coinsEarned,
+      totalCoins: updatedUser?.coins || 0,
+      streak: newStreak,
+    });
+  } catch (err) {
+    console.error("❌ Quiz result error:", err.message);
     res.status(500).json({ error: "Failed to save result" });
   }
 });
@@ -1665,6 +1537,38 @@ app.get("/quiz/history/:userId", async (req, res) => {
     res.json(results);
   } catch {
     res.status(500).json({ error: "Failed to load history" });
+  }
+});
+
+// ── Leaderboard — ranked by coins, scoped to exam ─────────────────────────────
+app.get("/leaderboard/:exam", async (req, res) => {
+  const { exam } = req.params;
+  const userId = req.query.userId;
+  try {
+    // Top 20 players for this exam by coins
+    const topUsers = await getUsers()
+      .find({ exam, coins: { $gt: 0 } })
+      .sort({ coins: -1 })
+      .limit(20)
+      .project({ userId: 1, userName: 1, coins: 1, streak: 1 })
+      .toArray();
+
+    // User's personal rank
+    let userRank = null;
+    if (userId) {
+      const userDoc = await getUsers().findOne({ userId });
+      const userCoins = userDoc?.coins || 0;
+      const higherCount = await getUsers().countDocuments({
+        exam,
+        coins: { $gt: userCoins },
+      });
+      userRank = higherCount + 1;
+    }
+
+    res.json({ leaderboard: topUsers, userRank });
+  } catch (err) {
+    console.error("❌ Leaderboard error:", err.message);
+    res.status(500).json({ error: "Failed to fetch leaderboard" });
   }
 });
 
@@ -1756,29 +1660,18 @@ app.post("/image/generate", async (req, res) => {
   }
 });
 
-// ✅ FIX 4: /image/edit — normalize MIME before passing to infipEdit
 app.post("/image/edit", upload.single("image"), async (req, res) => {
   try {
     if (!req.file)
       return res.status(400).json({ error: "Image file required" });
-
-    const safeMime = normalizeMimeType(req.file.buffer, req.file.mimetype);
-
-    if (safeMime === "application/pdf")
+    if (req.file.mimetype === "application/pdf")
       return res
         .status(400)
         .json({ error: "PDF not supported for image edit" });
-
-    if (!SUPPORTED_VISION_MIMES.includes(safeMime))
-      return res
-        .status(400)
-        .json({ error: `Unsupported image type: ${safeMime}` });
-
     const prompt =
       typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
     if (!prompt) return res.status(400).json({ error: "Edit prompt required" });
-
-    const result = await infipEdit(req.file.buffer, safeMime, prompt, {
+    const result = await infipEdit(req.file.buffer, req.file.mimetype, prompt, {
       width: req.body?.width,
       height: req.body?.height,
     });
@@ -1797,84 +1690,32 @@ app.post("/image/edit", upload.single("image"), async (req, res) => {
   }
 });
 
-const cleanPdfText = (text) => {
-  if (!text) return "";
-
-  const lines = text.split("\n");
-  const cleanedLines = [];
-  let consecutiveBlankLines = 0;
-
-  for (const line of lines) {
-    const trimmedLine = line.trim();
-
-    // Skip lines that look like page numbers
-    if (/^(\d+|page\s+\d+)$/i.test(trimmedLine)) {
-      continue;
-    }
-
-    if (trimmedLine === "") {
-      consecutiveBlankLines++;
-      if (consecutiveBlankLines < 2) {
-        cleanedLines.push(trimmedLine);
-      }
-    } else {
-      consecutiveBlankLines = 0;
-      cleanedLines.push(line); // Push the original line to preserve indentation
-    }
-  }
-
-  return cleanedLines.join("\n").trim();
-};
-
-// ✅ FIX 2+3: /image — PDF handled properly; images use new callVisionAI()
 app.post("/image", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "File required" });
-
-    const safeMime = normalizeMimeType(req.file.buffer, req.file.mimetype);
-
-    // ── PDF path ──────────────────────────────────────────────────────────────
-    if (safeMime === "application/pdf") {
+    if (req.file.mimetype === "application/pdf") {
       try {
-        const pdf = await getDocumentProxy(new Uint8Array(req.file.buffer));
-        const { text } = await extractText(pdf, { mergePages: true });
+        const { text } = await extractText(req.file.buffer);
         req.file.buffer = null;
-        const cleanedText = cleanPdfText(text);
-        if (cleanedText && cleanedText.length > 50) {
-          const answer = await askAI(cleanedText, req.body.exam);
+        if (text && text.trim().length > 50) {
+          const answer = await askAI(text, req.body.exam);
           return res.json({ answer });
         }
-        // PDF had no extractable text (scanned) — cannot use vision for PDFs
-        return res.status(422).json({
-          error:
-            "This PDF appears to be a scanned image. Please upload it as a JPG or PNG instead.",
-        });
-      } catch (pdfErr) {
-        console.warn("⚠️ PDF extraction error:", pdfErr.message);
-        req.file.buffer = null;
-        return res.status(422).json({
-          error:
-            "Could not read this PDF. Try converting it to an image first.",
-        });
+      } catch {
+        console.log(
+          "⚠️ Local PDF extraction failed, switching to Vision AI..."
+        );
       }
     }
-    // ── Image path ────────────────────────────────────────────────────────────
-    if (!SUPPORTED_VISION_MIMES.includes(safeMime)) {
-      req.file.buffer = null;
-      return res.status(400).json({
-        error: `Unsupported file type: ${safeMime}. Please upload a JPG, PNG, or WebP image.`,
-      });
-    }
-
-    // ✅ Uses new callVisionAI — correct MIME + proper Groq array format
-    const answer = await callVisionAI(req.file.buffer, safeMime, req.body.exam);
+    const answer = await askAIWithImage(
+      req.file.buffer,
+      req.file.mimetype,
+      req.body.exam
+    );
     req.file.buffer = null;
-    return res.json({ answer });
-  } catch (err) {
-    console.error("❌ /image error:", err.message);
-    return res
-      .status(500)
-      .json({ error: err.message || "File processing failed." });
+    res.json({ answer });
+  } catch {
+    res.status(500).json({ error: "Image failed" });
   }
 });
 
@@ -1968,16 +1809,16 @@ app.delete("/user/:userId/delete-data", async (req, res) => {
 app.use((req, res) => res.status(404).json({ error: "Route not found" }));
 app.use((err, req, res, next) => {
   if (err.code === "LIMIT_FILE_SIZE")
-    return res.status(413).json({
-      error: `File too large. Maximum allowed size is ${MAX_UPLOAD_MB}MB.`,
-    });
+    return res
+      .status(413)
+      .json({ error: "File too large. Maximum allowed size is 5MB." });
   console.error("❌ Server error:", err.message);
   res.status(500).json({ error: "Internal server error" });
 });
 
 // ── Start server ──────────────────────────────────────────────────────────────
-connectDB().then(() => {
-  startJobCron(getJobs, getUsers);
+connectDB().then(async () => {
+  await startJobCron(getJobs, getUsers);
 
   cron.schedule("30 0 * * *", runDailyPregeneration, { timezone: "UTC" });
   console.log("✅ Raw news cron scheduled — 6:00 AM IST daily");
