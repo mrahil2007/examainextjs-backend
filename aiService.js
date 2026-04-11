@@ -189,7 +189,7 @@ const callGemini = async (contents, exam, isVision = false, memory = []) => {
 
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -244,7 +244,7 @@ const callGemini = async (contents, exam, isVision = false, memory = []) => {
       if (!text) throw new Error("Gemini returned empty response");
 
       console.log(
-        `✅ gemini-2.5-flash-lite answered using key ${attempt + 1} of ${
+        `✅ gemini-2.5-flash answered using key ${attempt + 1} of ${
           GEMINI_KEYS.length
         }`
       );
@@ -402,7 +402,7 @@ If it contains notes or diagrams, explain the key concepts clearly.`,
   // 1️⃣ Try Gemini Vision first (with key rotation)
   try {
     const answer = await callGemini(contents, exam, true);
-    console.log("✅ Image/PDF analyzed by gemini-2.5-flash-lite Vision");
+    console.log("✅ Image/PDF analyzed by gemini-2.5-flash Vision");
     return answer;
   } catch (err) {
     console.warn(
@@ -571,7 +571,7 @@ export const askAIAgent = async (question, exam = "General") => {
 
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

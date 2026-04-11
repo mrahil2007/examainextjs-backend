@@ -96,6 +96,7 @@ app.use(
       "https://ai-exam-tutor-ten.vercel.app",
       "http://localhost:5173",
       "http://10.0.2.2:5050",
+      "http://localhost:3000",
     ],
     methods: ["GET", "POST", "PATCH", "DELETE"],
   })
@@ -428,7 +429,7 @@ const callGeminiOnce = async (prompt, maxOutputTokens = 3000) => {
     const key = getNextGeminiKey();
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1079,7 +1080,7 @@ const generateHinglishInBatches = async (rawItems, exam, today) => {
 
       try {
         const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
