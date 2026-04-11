@@ -308,10 +308,10 @@ const fetchWorldBankData = async (countryCode, indicator) => {
 
 // ── AI helpers ────────────────────────────────────────────────────────────────
 const GROQ_MODELS = [
-  { id: "llama-3.1-8b-instant", MaxCompletionTokens: 8000 },
   { id: "llama-3.3-70b-versatile", MaxCompletionTokens: 8000 },
   { id: "openai/gpt-oss-20b", MaxCompletionTokens: 8000 },
   { id: "openai/gpt-oss-120b", MaxCompletionTokens: 8000 },
+  { id: "llama-3.1-8b-instant", MaxCompletionTokens: 8000 },
 ];
 const CONTEXT_EXTRA_TOKENS = 2000;
 const userQuizCounts = new Map();
@@ -920,7 +920,11 @@ const fetchAndStoreRawNews = async () => {
   for (const url of sources) {
     if (allItems.length >= 100) break;
     try {
-      const feed = await rssParser.parseURL(url);
+      const feed = await parseRSSWithFallback(url); // was: rssParser.parseURL(url)
+      if (!feed) {
+        console.warn(`[RAW] Skipping ${url}`);
+        continue;
+      }
       let count = 0;
       for (const item of feed.items || []) {
         if (count >= 15) break;
