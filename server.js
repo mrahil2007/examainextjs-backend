@@ -22,7 +22,7 @@ import {
 } from "./aiService.js";
 import Groq from "groq-sdk";
 import { MongoClient, ObjectId } from "mongodb";
-import rateLimit from "express-rate-limit";
+
 import admin from "firebase-admin";
 
 import { initFirebase, startJobCron } from "./JobFetcher.js";
@@ -104,33 +104,12 @@ app.use(
 app.use(express.json({ limit: "10kb" }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: { error: "Too many requests. Please try again later." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-const aiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 15,
-  message: { error: "Too many AI requests. Please slow down." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-const quizLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 20,
-  message: { error: "Limit reached. Try again in an hour." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
 
-app.use(apiLimiter);
-app.use("/chat", aiLimiter);
-app.use("/chart/generate", aiLimiter);
-app.use("/image", aiLimiter);
-app.use("/quiz/generate", quizLimiter);
+// app.use(apiLimiter);
+// app.use("/chat", aiLimiter);
+// app.use("/chart/generate", aiLimiter);
+// app.use("/image", aiLimiter);
+// app.use("/quiz/generate", quizLimiter);
 
 const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
