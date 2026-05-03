@@ -75,10 +75,31 @@ LANGUAGE RULES (Highest Priority - Always Follow):
 - Detect the language of the user's message carefully.
 - If the user writes in Hindi (Devanagari script: क, ख, ग...), ALWAYS reply in Hindi (Devanagari).
 - If the user writes in English only, reply in English.
-- If the user writes in Hinglish (Hindi words using English/Roman script, e.g. "bhai ye batao", "kaise solve kare"), reply in Hinglish (Roman script Hindi).
-- If the message mixes Devanagari + English terms (e.g. "Photosynthesis क्या है"), reply in Hindi (Devanagari) but keep technical/English terms as-is (e.g. Photosynthesis, GDP, DNA).
-- NEVER translate proper nouns, technical terms, acronyms, or exam-specific terms (e.g. UPSC, GDP, Fundamental Rights, etc.).
+- If the user writes in Hinglish (Hindi words using English/Roman script, e.g. "bhai ye batao"), reply in Hinglish.
+- If the message mixes Devanagari + English terms, reply in Hindi but keep technical terms as-is.
+- If the user writes in ANY OTHER language, reply in that SAME language. This includes but is not limited to:
+
+  SOUTH ASIAN: Nepali, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada, Malayalam, Punjabi, Odia, Assamese, Sinhala, Urdu, Sindhi, Kashmiri, Konkani, Manipuri, Maithili
+
+  EAST ASIAN: Chinese (Simplified), Chinese (Traditional), Japanese, Korean, Mongolian, Tibetan
+
+  SOUTHEAST ASIAN: Indonesian, Malay, Thai, Vietnamese, Filipino/Tagalog, Burmese, Khmer, Lao, Javanese, Sundanese, Cebuano
+
+  CENTRAL ASIAN: Kazakh, Uzbek, Kyrgyz, Tajik, Turkmen, Azerbaijani, Georgian, Armenian
+
+  MIDDLE EASTERN: Arabic, Persian/Farsi, Turkish, Hebrew, Kurdish, Pashto, Dari, Amharic
+
+  EUROPEAN: Spanish, French, German, Portuguese, Italian, Russian, Polish, Dutch, Greek, Swedish, Norwegian, Danish, Finnish, Czech, Slovak, Hungarian, Romanian, Bulgarian, Croatian, Serbian, Ukrainian, Catalan, Basque, Galician, Welsh, Irish, Scots Gaelic, Icelandic, Albanian, Macedonian, Slovenian, Estonian, Latvian, Lithuanian, Belarusian, Moldovan, Luxembourgish, Maltese, Afrikaans
+
+  AFRICAN: Swahili, Hausa, Yoruba, Igbo, Zulu, Xhosa, Somali, Shona, Amharic, Oromo, Twi, Wolof, Tigrinya, Kinyarwanda, Lingala, Sesotho
+
+  AMERICAS & PACIFIC: Quechua, Guaraní, Nahuatl, Hawaiian, Māori, Samoan, Tongan, Fijian, Tok Pisin
+
+- NEVER tell the user you can only respond in Hindi or English.
+- NEVER refuse to respond in a user's language because it is not Hindi or English.
+- NEVER switch to a different language than the one the user is writing in.
 - Match the user's exact language style — do not upgrade or downgrade their language choice.
+- NEVER translate proper nouns, technical terms, acronyms, or exam-specific terms (e.g. UPSC, GDP, DNA).
 `;
 
 // ── EXAM SYSTEM PROMPTS ───────────────────────────────────────────────────────

@@ -984,7 +984,12 @@ const fetchAndStoreRawNews = async () => {
 };
 
 const buildEnglishPrompt = (headlines, exam, today) =>
-  `Today is ${today}. Generate current affairs for ${exam} exam students in India.
+  `ROLE: You are a senior current affairs editor writing for ${exam} exam students in India.
+Today is ${today}.
+
+Write concise but complete exam-focused news briefings.
+Each summary MUST be 80-90 words, across 4-5 factual sentences.
+No summary may be below 80 words.
 
 Headlines:
 ${headlines
@@ -996,17 +1001,29 @@ ${headlines
   )
   .join("\n")}
 
-Pick 40 most exam-relevant items. Return ONLY a raw JSON array — no markdown, no extra text:
+Pick 12-15 most exam-relevant items. Return ONLY a raw JSON array — no markdown, no extra text:
 [{
   "id": "ca_1",
   "category": "National",
   "headline": "factual headline max 12 words",
-  "summary": "4-5 sentences with key facts, numbers, names. Max 80 words. Do not use quotes inside text.",
+  "summary": "80-90 words in 4-5 sentences with key facts, numbers, names, causes, impact, and exam context. Do not use quotes inside text.",
   "importance": "high",
   "examRelevance": "1 sentence on which exam topic this covers",
   "tags": ["${exam}"]
 }]
 category: National/International/Economy/Science & Tech/Sports/Environment/Awards/Defence/Health`;
+
+const countWords = (text = "") =>
+  String(text).trim().split(/\s+/).filter(Boolean).length;
+
+const normalizeEnglishAffairs = (affairs) => {
+  if (!Array.isArray(affairs)) return [];
+  const valid = affairs.filter((item) => countWords(item?.summary) >= 80);
+  valid.forEach((item, i) => {
+    item.id = `ca_${i + 1}`;
+  });
+  return valid;
+};
 
 const buildHinglishPromptBatch = (headlines, exam, today) =>
   `ROLE: You are a senior editorial journalist writing Hinglish news for competitive exam students.
@@ -1148,12 +1165,17 @@ const generateForExamLang = async (exam, lang) => {
         today
       );
     } else {
-      const prompt = buildEnglishPrompt(rawDoc.items.slice(0, 30), exam, today);
+      const prompt = buildEnglishPrompt(rawDoc.items.slice(0, 40), exam, today);
       const raw = await callGroqWithFallback(prompt, true);
       if (!raw) throw new Error("Groq returned nothing");
       const cleaned = raw.replace(/```json|```/gi, "").trim();
       const sanitized = sanitizeJSON(cleaned);
-      affairs = JSON.parse(sanitized);
+      affairs = normalizeEnglishAffairs(JSON.parse(sanitized));
+      if (affairs.length < 10) {
+        throw new Error(
+          `Too few English items with 80+ word summaries: ${affairs.length}`
+        );
+      }
     }
 
     if (!Array.isArray(affairs) || affairs.length < 10)
