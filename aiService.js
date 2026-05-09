@@ -73,10 +73,10 @@ const buildMemoryBlock = (facts = []) => {
 const getLanguageRule = () => `
 LANGUAGE RULES (Highest Priority - Always Follow):
 - Detect the language of the user's message carefully.
-- If the user writes in Hindi (Devanagari script: क, ख, ग...), ALWAYS reply in Hindi (Devanagari).
 - If the user writes in English only, reply in English.
-- If the user writes in Hinglish (Hindi words using English/Roman script, e.g. "bhai ye batao"), reply in Hinglish.
-- If the message mixes Devanagari + English terms, reply in Hindi but keep technical terms as-is.
+- If the user writes in Hinglish (Hindi words using English/Roman script, e.g. "bhai ye batao"), reply in Hinglish, do not reply in Hindi script or devnagari.
+- if the user asking to change language then change to that language and reply in that language.
+- If the message mixes Devanagari + English terms, reply in Hinglish but keep technical terms as-is.
 - If the user writes in ANY OTHER language, reply in that SAME language. This includes but is not limited to:
 
   SOUTH ASIAN: Nepali, Bengali, Tamil, Telugu, Marathi, Gujarati, Kannada, Malayalam, Punjabi, Odia, Assamese, Sinhala, Urdu, Sindhi, Kashmiri, Konkani, Manipuri, Maithili

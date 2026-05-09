@@ -1,0 +1,145 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// INTEGRATION.md — Wiring billing into your existing flat backend
+//
+// Your backend folder is flat (no src/), so the new billing module slots
+// in as two new sibling folders: backend/billing/ and backend/lib/
+// ═══════════════════════════════════════════════════════════════════════════
+
+/*
+
+STEP 1 — Copy the new files
+────────────────────────────────────────────────────────────────────────────
+
+Drop these two folders into your backend/ directory:
+
+    backend/
+    ├── billing/        ← 9 files (constants, errors, repository, etc.)
+    └── lib/            ← 1 file  (logger.js)
+
+After copying, your structure looks like:
+
+    backend/
+    ├── billing/
+    │   ├── constants.js
+    │   ├── errors.js
+    │   ├── index.js
+    │   ├── playApiClient.js
+    │   ├── repository.js
+    │   ├── router.js
+    │   ├── service.js
+    │   ├── subscriptionState.js
+    │   └── webhookAuth.js
+    ├── lib/
+    │   └── logger.js
+    ├── server.js              ← edit this
+    ├── aiService.js
+    ├── JobFetcher.js
+    ├── JobRouter.js
+    ├── Quizprompts.js
+    ├── ResumeBuilder.js
+    ├── package.json
+    └── .env                   ← add one variable
+
+────────────────────────────────────────────────────────────────────────────
+STEP 2 — Edit server.js  (3 small changes)
+────────────────────────────────────────────────────────────────────────────
+
+[ EDIT 1 of 3 — add this import at the top, near your other imports ]
+
+    import { initializeBilling } from "./billing/index.js";
+
+
+[ EDIT 2 of 3 — DELETE the entire bottom billing section ]
+
+Find the comment that starts with:
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PRO BILLING ROUTES — add these to server.js
+    // ═══════════════════════════════════════════════════════════════════════════
+
+DELETE everything from that comment down to (but NOT including) the final
+app.listen line. You're removing approximately:
+
+    - PACKAGE_NAME, PRODUCT_ID_INR, PRODUCT_ID_USD constants
+    - getPlayAccessToken()
+    - verifyPlayPurchase()
+    - app.post("/billing/verify-purchase", ...)
+    - app.get("/billing/pro-status/:userId", ...)
+    - app.post("/billing/webhook", ...)
+
+The new module replaces all of it.
+
+You can also remove this import from the top of server.js if nothing else
+in your code uses it (it's now only needed inside billing/playApiClient.js):
+
+    import { GoogleAuth } from "google-auth-library";
+
+
+[ EDIT 3 of 3 — wire the billing router into connectDB() ]
+
+Find your existing connectDB().then(...) block at the bottom:
+
+    connectDB().then(async () => {
+      await startJobCron(getJobs, getUsers);
+      cron.schedule("30 0 * * *", runDailyPregeneration, { timezone: "UTC" });
+      ...
+    });
+
+Add two lines just after `await startJobCron(...)`:
+
+    connectDB().then(async () => {
+      await startJobCron(getJobs, getUsers);
+
+      // ── Mount billing module ────────────────────────────────────
+      const billing = await initializeBilling({ db });
+      app.use("/billing", billing.router);
+
+      cron.schedule("30 0 * * *", runDailyPregeneration, { timezone: "UTC" });
+      ...
+    });
+
+
+────────────────────────────────────────────────────────────────────────────
+STEP 3 — Update .env
+────────────────────────────────────────────────────────────────────────────
+
+Add this one line. Leave it commented out for now — you'll set the real
+value when you configure Pub/Sub authentication later:
+
+    # BILLING_WEBHOOK_AUDIENCE=https://api.examai-in.com/billing/webhook
+
+These are optional overrides (defaults work fine):
+
+    # PRODUCT_ID_INR=examai_pro_monthly_inr
+    # PRODUCT_ID_USD=examai_pro_monthly_usd
+    # LOG_LEVEL=info
+
+Your existing variables stay unchanged:
+
+    GOOGLE_PLAY_SERVICE_ACCOUNT={"type":"service_account",...}
+    GOOGLE_PLAY_PACKAGE_NAME=com.examai.app
+
+
+────────────────────────────────────────────────────────────────────────────
+STEP 4 — Test
+────────────────────────────────────────────────────────────────────────────
+
+Restart your server. You should see these log lines on startup:
+
+    [billing:play-api] Initialized Google Play Auth
+    [billing:index] Billing indexes ensured
+    [billing:index] Billing module initialized
+
+If you see errors about missing imports, check that:
+1. billing/ folder is at backend/billing/ (not backend/src/billing/)
+2. lib/ folder is at backend/lib/ (not backend/src/lib/)
+3. Your package.json has "type": "module" (since you use ES imports already)
+
+The endpoints work exactly the same as before:
+    POST /billing/verify-purchase
+    GET  /billing/pro-status/:userId
+    POST /billing/webhook
+
+Your Android app needs no changes.
+
+*/

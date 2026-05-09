@@ -15,6 +15,7 @@
         "express-rate-limit": "^8.2.1",
         "firebase": "^12.10.0",
         "firebase-admin": "^13.7.0",
+        "google-auth-library": "^10.6.2",
         "groq-sdk": "^0.37.0",
         "linkedin-jobs-api": "^1.0.7",
         "mongodb": "^7.1.0",

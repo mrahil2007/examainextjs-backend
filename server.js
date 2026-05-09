@@ -22,13 +22,12 @@ import {
 } from "./aiService.js";
 import Groq from "groq-sdk";
 import { MongoClient, ObjectId } from "mongodb";
-
 import admin from "firebase-admin";
-
 import { initFirebase, startJobCron } from "./JobFetcher.js";
 import cron from "node-cron";
 import createJobRouter from "./JobRouter.js";
 import createResumeRouter from "./ResumeBuilder.js";
+import { initializeBilling } from "./billing/index.js";
 
 if (!process.env.GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY missing!");
@@ -88,28 +87,26 @@ export const sendPushNotification = async (
 const app = express();
 app.set("trust proxy", 1);
 
-app.use(
-  cors({
-    origin: [
-      "https://examai-in.com",
-      "https://www.examai-in.com",
-      "https://ai-exam-tutor-ten.vercel.app",
-      "http://localhost:5173",
-      "http://10.0.2.2:5050",
-      "http://localhost:3000",
-    ],
-    methods: ["GET", "POST", "PATCH", "DELETE"],
-  })
-);
+const ALLOWED_ORIGINS = [
+  "https://examai-in.com",
+  "https://www.examai-in.com",
+  "https://ai-exam-tutor-ten.vercel.app",
+  "http://localhost:5173",
+  "http://10.0.2.2:5050",
+  "http://localhost:3000",
+];
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) callback(null, true);
+    else callback(new Error(`CORS blocked: ${origin}`));
+  },
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "10kb" }));
-
-// ── Rate limiting ─────────────────────────────────────────────────────────────
-
-// app.use(apiLimiter);
-// app.use("/chat", aiLimiter);
-// app.use("/chart/generate", aiLimiter);
-// app.use("/image", aiLimiter);
-// app.use("/quiz/generate", quizLimiter);
 
 const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -130,7 +127,6 @@ async function connectDB() {
   await db
     .collection("quiz_results")
     .createIndex({ userId: 1, exam: 1, topic: 1, quizId: 1 });
-  // Leaderboard index
   await db.collection("users").createIndex({ exam: 1, coins: -1 });
   console.log("✅ MongoDB connected");
 }
@@ -146,7 +142,6 @@ const getQuizzes = () => db.collection("quizzes");
 app.use("/jobs", createJobRouter(getJobs));
 app.use("/resume", createResumeRouter(getResumes));
 
-const caGenerating = new Set();
 const searchCache = new Map();
 const SEARCH_CACHE_DURATION = 60 * 60 * 1000;
 
@@ -857,11 +852,11 @@ app.get("/mobile/config", (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const calculateCoins = (score, total, timeTaken, streak) => {
-  const baseCoins = score * 10; // +10 per correct
-  const wrongDeduction = (total - score) * 3; // -3 per wrong
-  const speedBonus = timeTaken < 60 ? 20 : timeTaken < 120 ? 10 : 0; // fast = bonus
-  const streakBonus = streak >= 7 ? 30 : streak >= 3 ? 15 : 0; // streak bonus
-  const perfectBonus = score === total ? 50 : 0; // perfect score bonus
+  const baseCoins = score * 10;
+  const wrongDeduction = (total - score) * 3;
+  const speedBonus = timeTaken < 60 ? 20 : timeTaken < 120 ? 10 : 0;
+  const streakBonus = streak >= 7 ? 30 : streak >= 3 ? 15 : 0;
+  const perfectBonus = score === total ? 50 : 0;
   return Math.max(
     0,
     baseCoins - wrongDeduction + speedBonus + streakBonus + perfectBonus
@@ -871,14 +866,27 @@ const calculateCoins = (score, total, timeTaken, streak) => {
 // ═══════════════════════════════════════════════════════════════════════════
 // CURRENT AFFAIRS
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// NOTE: Released Android app sends ?lang=hinglish for Hindi/Hinglish users.
+// We accept the param for backwards compatibility but always serve English
+// content (the released app's parser is happy as long as the response shape
+// is preserved). Hinglish generation will be re-introduced or fully removed
+// in a future app release.
+// ═══════════════════════════════════════════════════════════════════════════
 
 const fetchAndStoreRawNews = async () => {
   const today = new Date().toISOString().split("T")[0];
 
   const existing = await db.collection("raw_news").findOne({ date: today });
   if (existing?.items?.length >= 10) {
-    console.log(`[RAW] Already have ${existing.items.length} items for today`);
-    return;
+    const fetchedAt = existing.fetchedAt ? new Date(existing.fetchedAt) : null;
+    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000);
+    if (fetchedAt && fetchedAt > sixHoursAgo) {
+      console.log(
+        `[RAW] Already have fresh news (${existing.items.length} items)`
+      );
+      return;
+    }
   }
 
   console.log("[RAW] Fetching fresh news from RSS feeds...");
@@ -900,7 +908,7 @@ const fetchAndStoreRawNews = async () => {
   for (const url of sources) {
     if (allItems.length >= 100) break;
     try {
-      const feed = await parseRSSWithFallback(url); // was: rssParser.parseURL(url)
+      const feed = await parseRSSWithFallback(url);
       if (!feed) {
         console.warn(`[RAW] Skipping ${url}`);
         continue;
@@ -917,8 +925,14 @@ const fetchAndStoreRawNews = async () => {
           pubDate && Date.now() - pubDate.getTime() < 48 * 60 * 60 * 1000;
         if (!pubDate || isToday || isRecent) {
           seen.add(item.title);
-          const rawSnippet = item.contentSnippet || item.summary || "";
+          const rawSnippet =
+            item.content ||
+            item.contentSnippet ||
+            item.summary ||
+            item["content:encoded"] ||
+            "";
           const cleanSnippet = rawSnippet
+            .replace(/<[^>]*>/g, "")
             .replace(/[\r\n\t]+/g, " ")
             .replace(/\s{2,}/g, " ")
             .trim()
@@ -983,232 +997,12 @@ const fetchAndStoreRawNews = async () => {
   console.log(`[RAW] ✅ Stored ${capped.length} headlines — 0 API cost`);
 };
 
-const buildEnglishPrompt = (headlines, exam, today) =>
-  `ROLE: You are a senior current affairs editor writing for ${exam} exam students in India.
-Today is ${today}.
-
-Write concise but complete exam-focused news briefings.
-Each summary MUST be 80-90 words, across 4-5 factual sentences.
-No summary may be below 80 words.
-
-Headlines:
-${headlines
-  .map(
-    (n, i) =>
-      `${i + 1}. ${n.title}${n.snippet ? ` — ${n.snippet}` : ""} [${
-        n.source || ""
-      }]`
-  )
-  .join("\n")}
-
-Pick 12-15 most exam-relevant items. Return ONLY a raw JSON array — no markdown, no extra text:
-[{
-  "id": "ca_1",
-  "category": "National",
-  "headline": "factual headline max 12 words",
-  "summary": "80-90 words in 4-5 sentences with key facts, numbers, names, causes, impact, and exam context. Do not use quotes inside text.",
-  "importance": "high",
-  "examRelevance": "1 sentence on which exam topic this covers",
-  "tags": ["${exam}"]
-}]
-category: National/International/Economy/Science & Tech/Sports/Environment/Awards/Defence/Health`;
-
-const countWords = (text = "") =>
-  String(text).trim().split(/\s+/).filter(Boolean).length;
-
-const normalizeEnglishAffairs = (affairs) => {
-  if (!Array.isArray(affairs)) return [];
-  const valid = affairs.filter((item) => countWords(item?.summary) >= 80);
-  valid.forEach((item, i) => {
-    item.id = `ca_${i + 1}`;
-  });
-  return valid;
-};
-
-const buildHinglishPromptBatch = (headlines, exam, today) =>
-  `ROLE: You are a senior editorial journalist writing Hinglish news for competitive exam students.
-
-STYLE:
-- Write in Roman Hindi (no Devanagari)
-- Formal newsroom tone — not social media
-- Natural Hinglish: Hindi structure + English terms for institutions/policies
-- Example: "Sarkar ne fiscal deficit target maintain karte hue naye reforms announce kiye."
-- Numbers in digits, names unchanged, no repetition
-
-STRICTLY AVOID:
-- "ye ek important khabar hai", "students ko dhyan dena chahiye", "ye behad zaroori hai"
-- Casual tone, dramatization, bullet points, emojis
-- Quotes inside text fields
-
-Headlines for ${exam} students (today: ${today}):
-${headlines
-  .map((n, i) => `${i + 1}. ${n.title}${n.snippet ? ` — ${n.snippet}` : ""}`)
-  .join("\n")}
-
-Pick 8-10 most exam-relevant items. Return ONLY a raw JSON array — no markdown:
-[{
-  "id": "ca_1",
-  "category": "National",
-  "headline": "Hinglish mein sharp factual headline — max 12 words",
-  "summary": "4-5 sentences. Har sentence ek alag fact. Min 100 words total.",
-  "importance": "high",
-  "examRelevance": "Konsa exam topic cover hota hai — 1-2 sentences",
-  "tags": ["${exam}"]
-}]
-category: National/International/Economy/Science & Tech/Sports/Environment/Awards/Defence/Health`;
-
-const generateHinglishInBatches = async (rawItems, exam, today) => {
-  console.log(`[Hinglish] Splitting into 3 parts → all 3 Gemini keys parallel`);
-
-  const chunkSize = Math.ceil(rawItems.length / 3);
-  const chunks = [
-    rawItems.slice(0, chunkSize),
-    rawItems.slice(chunkSize, chunkSize * 2),
-    rawItems.slice(chunkSize * 2),
-  ].filter((c) => c.length > 0);
-
-  const results = await Promise.all(
-    chunks.map(async (chunk, i) => {
-      const key = GEMINI_KEYS[i % GEMINI_KEYS.length];
-      const prompt = buildHinglishPromptBatch(chunk, exam, today);
-
-      console.log(`[Hinglish] Key ${i + 1} → ${chunk.length} headlines`);
-
-      try {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { temperature: 0.3, maxOutputTokens: 3000 },
-            }),
-          }
-        );
-        if (!response.ok) {
-          console.warn(
-            `⚠️ Gemini key ${i + 1} HTTP ${response.status} → Groq fallback`
-          );
-          throw new Error("Gemini failed");
-        }
-        const data = await response.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-        if (!text) throw new Error("Empty response");
-        console.log(`✅ Gemini key ${i + 1} succeeded`);
-        return text;
-      } catch {
-        console.warn(`[Hinglish] Key ${i + 1} failed → Groq fallback`);
-        try {
-          return await callGroqWithFallback(prompt, true);
-        } catch {
-          console.warn(`[Hinglish] Key ${i + 1} Groq also failed`);
-          return null;
-        }
-      }
-    })
-  );
-
-  const allItems = [];
-  results.forEach((raw, i) => {
-    if (!raw) return;
-    try {
-      const sanitized = sanitizeJSON(raw);
-      const items = JSON.parse(sanitized);
-      allItems.push(...items);
-      console.log(`[Hinglish] Key ${i + 1} → ${items.length} items`);
-    } catch (err) {
-      console.warn(`[Hinglish] Key ${i + 1} parse failed:`, err.message);
-    }
-  });
-
-  allItems.forEach((item, i) => {
-    item.id = `ca_${i + 1}`;
-  });
-  console.log(`✅ [Hinglish] Total: ${allItems.length} items`);
-  return allItems;
-};
-
-const generateForExamLang = async (exam, lang) => {
-  const today = new Date().toISOString().split("T")[0];
-
-  let lock;
-  try {
-    lock = await db
-      .collection("current_affairs")
-      .findOneAndUpdate(
-        { date: today, exam, lang, status: { $exists: false } },
-        { $set: { status: "generating", lockedAt: new Date() } },
-        { upsert: true, returnDocument: "after" }
-      );
-  } catch {
-    return;
-  }
-
-  if (!lock || lock.status !== "generating") return;
-
-  try {
-    let rawDoc = await db.collection("raw_news").findOne({ date: today });
-    if (!rawDoc?.items?.length) {
-      console.log("[CA] Raw news missing — fetching now...");
-      await fetchAndStoreRawNews();
-      rawDoc = await db.collection("raw_news").findOne({ date: today });
-    }
-    if (!rawDoc?.items?.length) throw new Error("No raw news available");
-
-    let affairs = [];
-
-    if (lang === "hinglish") {
-      affairs = await generateHinglishInBatches(
-        rawDoc.items.slice(0, 40),
-        exam,
-        today
-      );
-    } else {
-      const prompt = buildEnglishPrompt(rawDoc.items.slice(0, 40), exam, today);
-      const raw = await callGroqWithFallback(prompt, true);
-      if (!raw) throw new Error("Groq returned nothing");
-      const cleaned = raw.replace(/```json|```/gi, "").trim();
-      const sanitized = sanitizeJSON(cleaned);
-      affairs = normalizeEnglishAffairs(JSON.parse(sanitized));
-      if (affairs.length < 10) {
-        throw new Error(
-          `Too few English items with 80+ word summaries: ${affairs.length}`
-        );
-      }
-    }
-
-    if (!Array.isArray(affairs) || affairs.length < 10)
-      throw new Error(`Too few items: ${affairs?.length}`);
-
-    await db.collection("current_affairs").updateOne(
-      { date: today, exam, lang },
-      {
-        $set: {
-          affairs,
-          status: "done",
-          generatedAt: new Date(),
-          sourceCount: rawDoc.items.length,
-        },
-      }
-    );
-    console.log(`✅ [CA] ${exam} | ${lang} | ${affairs.length} items stored`);
-  } catch (err) {
-    console.error(`❌ [CA] ${exam} | ${lang}:`, err.message);
-    await db
-      .collection("current_affairs")
-      .updateOne({ date: today, exam, lang }, { $set: { status: "failed" } });
-  }
-};
-
 const runDailyPregeneration = async () => {
-  console.log("[CRON] 🌅 Fetching raw news —", new Date().toISOString());
+  console.log("[CRON] 🌅 Daily news refresh —", new Date().toISOString());
+  await db.collection("raw_news").deleteMany({});
+  console.log("[CRON] 🗑️ Old news deleted");
   await fetchAndStoreRawNews();
-  const today = new Date().toISOString().split("T")[0];
-  await db.collection("current_affairs").deleteMany({ date: today });
-  console.log(
-    "[CRON] ✅ Raw news ready — AI will generate on first user request"
-  );
+  console.log("[CRON] ✅ Fresh news ready");
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1221,7 +1015,6 @@ app.get("/health", (req, res) => res.send("Server alive"));
 app.get("/admin/refresh-news", async (req, res) => {
   const today = new Date().toISOString().split("T")[0];
   await db.collection("raw_news").deleteMany({ date: today });
-  await db.collection("current_affairs").deleteMany({ date: today });
   await fetchAndStoreRawNews();
   res.json({ success: true, message: "News refreshed" });
 });
@@ -1467,12 +1260,11 @@ app.post("/quiz/generate", async (req, res) => {
   }
 });
 
-// ── Quiz Result — now calculates coins + streak ───────────────────────────────
+// ── Quiz Result ───────────────────────────────────────────────────────────────
 app.post("/quiz/result", async (req, res) => {
   const { userId, topic, exam, score, total, timeTaken, quizId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   try {
-    // Load current user for streak calculation
     const user = await getUsers().findOne({ userId });
     const today = new Date().toISOString().split("T")[0];
     const lastPlayed = user?.lastPlayedDate;
@@ -1480,7 +1272,6 @@ app.post("/quiz/result", async (req, res) => {
       .toISOString()
       .split("T")[0];
 
-    // Streak logic: same day = keep, yesterday = increment, else reset to 1
     const newStreak =
       lastPlayed === today
         ? user?.streak || 1
@@ -1490,7 +1281,6 @@ app.post("/quiz/result", async (req, res) => {
 
     const coinsEarned = calculateCoins(score, total, timeTaken, newStreak);
 
-    // Update user coins + streak atomically
     await getUsers().updateOne(
       { userId },
       {
@@ -1505,7 +1295,6 @@ app.post("/quiz/result", async (req, res) => {
       { upsert: true }
     );
 
-    // Save result record
     await getQuizResults().insertOne({
       userId,
       topic,
@@ -1519,7 +1308,6 @@ app.post("/quiz/result", async (req, res) => {
       createdAt: new Date(),
     });
 
-    // Return updated stats to client
     const updatedUser = await getUsers().findOne({ userId });
     res.json({
       success: true,
@@ -1546,12 +1334,11 @@ app.get("/quiz/history/:userId", async (req, res) => {
   }
 });
 
-// ── Leaderboard — ranked by coins, scoped to exam ─────────────────────────────
+// ── Leaderboard ───────────────────────────────────────────────────────────────
 app.get("/leaderboard/:exam", async (req, res) => {
   const { exam } = req.params;
   const userId = req.query.userId;
   try {
-    // Top 20 players for this exam by coins
     const topUsers = await getUsers()
       .find({ exam, coins: { $gt: 0 } })
       .sort({ coins: -1 })
@@ -1559,7 +1346,6 @@ app.get("/leaderboard/:exam", async (req, res) => {
       .project({ userId: 1, userName: 1, coins: 1, streak: 1 })
       .toArray();
 
-    // User's personal rank
     let userRank = null;
     if (userId) {
       const userDoc = await getUsers().findOne({ userId });
@@ -1578,62 +1364,62 @@ app.get("/leaderboard/:exam", async (req, res) => {
   }
 });
 
-// ── Current affairs ───────────────────────────────────────────────────────────
+// ── Current Affairs ───────────────────────────────────────────────────────────
+//
+// Backwards-compatible shape for the released app:
+//   { date, exam, lang, affairs: [{ id, category, headline, summary,
+//     importance, examRelevance, tags, source, pubDate }], cached, total }
+//
+// `lang` query param is accepted ("english" | "hinglish") but currently always
+// serves English content. Released-app users who chose Hinglish will see
+// English content with no crash, since all expected fields are present.
+// ═══════════════════════════════════════════════════════════════════════════
 app.get("/current-affairs/:exam", async (req, res) => {
   const { exam } = req.params;
   const lang = req.query.lang === "hinglish" ? "hinglish" : "english";
   const today = new Date().toISOString().split("T")[0];
 
   try {
-    const record = await db
-      .collection("current_affairs")
-      .findOne({ date: today, exam, lang });
+    let rawDoc = await db.collection("raw_news").findOne({ date: today });
 
-    if (record?.status === "done" && record?.affairs?.length >= 10) {
+    if (!rawDoc?.items?.length) {
+      console.log("[CA] No news in DB — fetching now...");
+      await fetchAndStoreRawNews();
+      rawDoc = await db.collection("raw_news").findOne({ date: today });
+    }
+
+    if (!rawDoc?.items?.length) {
       return res.json({
         date: today,
         exam,
         lang,
-        affairs: record.affairs,
-        cached: true,
+        affairs: [],
+        cached: false,
+        total: 0,
       });
     }
 
-    if (!record || record.status === "failed") generateForExamLang(exam, lang);
+    // Build response in the shape the released app expects
+    const affairs = rawDoc.items.map((item, i) => ({
+      id: `ca_${i + 1}`,
+      category: "National",
+      headline: item.title,
+      summary: item.snippet && item.snippet !== item.title ? item.snippet : "",
+      importance: "high",
+      examRelevance: "",
+      tags: [exam],
+      source: item.source,
+      pubDate: item.pubDate,
+    }));
 
-    const stale = await db
-      .collection("current_affairs")
-      .findOne({ exam, lang, status: "done" }, { sort: { date: -1 } });
-    if (stale?.affairs?.length) {
-      return res.json({
-        date: stale.date,
-        exam,
-        lang,
-        affairs: stale.affairs,
-        cached: true,
-      });
-    }
-
-    console.log(
-      `[CA] First ever run for ${exam}|${lang} — waiting for generation...`
-    );
-    for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, 3000));
-      const poll = await db
-        .collection("current_affairs")
-        .findOne({ date: today, exam, lang });
-      if (poll?.status === "done" && poll?.affairs?.length >= 10) {
-        return res.json({
-          date: today,
-          exam,
-          lang,
-          affairs: poll.affairs,
-          cached: true,
-        });
-      }
-    }
-
-    return res.json({ date: today, exam, lang, affairs: [], cached: false });
+    res.json({
+      date: rawDoc.date,
+      exam,
+      lang,
+      affairs,
+      cached: true,
+      total: affairs.length,
+    });
   } catch (err) {
     console.error("[CA] ❌", err.message);
     res.status(500).json({ error: "Failed to fetch current affairs" });
@@ -1811,37 +1597,19 @@ app.delete("/user/:userId/delete-data", async (req, res) => {
   }
 });
 
-// ── Error handlers ────────────────────────────────────────────────────────────
-app.use((req, res) => res.status(404).json({ error: "Route not found" }));
-app.use((err, req, res, next) => {
-  if (err.code === "LIMIT_FILE_SIZE")
-    return res
-      .status(413)
-      .json({ error: "File too large. Maximum allowed size is 5MB." });
-  console.error("❌ Server error:", err.message);
-  res.status(500).json({ error: "Internal server error" });
-});
+// ═══════════════════════════════════════════════════════════════════════════
+// START SERVER
+// ═══════════════════════════════════════════════════════════════════════════
 
-// ── Start server ──────────────────────────────────────────────────────────────
 connectDB().then(async () => {
   await startJobCron(getJobs, getUsers);
 
+  // ── Mount billing module ────────────────────────────────────────────────
+  const billing = await initializeBilling({ db });
+  app.use("/billing", billing.router);
+
   cron.schedule("30 0 * * *", runDailyPregeneration, { timezone: "UTC" });
   console.log("✅ Raw news cron scheduled — 6:00 AM IST daily");
-
-  setInterval(async () => {
-    try {
-      const tenMinsAgo = new Date(Date.now() - 10 * 60 * 1000);
-      const result = await db
-        .collection("current_affairs")
-        .updateMany(
-          { status: "generating", lockedAt: { $lt: tenMinsAgo } },
-          { $set: { status: "failed" } }
-        );
-      if (result.modifiedCount > 0)
-        console.log(`🔓 Released ${result.modifiedCount} stale CA locks`);
-    } catch {}
-  }, 10 * 60 * 1000);
 
   setInterval(() => {
     const now = Date.now();
@@ -1878,22 +1646,15 @@ connectDB().then(async () => {
     }
   });
 
-  cron.schedule("0 1 * * 0", async () => {
-    try {
-      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-      const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
-      const ca = await db
-        .collection("current_affairs")
-        .deleteMany({ generatedAt: { $lt: sevenDaysAgo } });
-      const rn = await db
-        .collection("raw_news")
-        .deleteMany({ fetchedAt: { $lt: twoDaysAgo } });
-      console.log(
-        `🧹 Weekly cleanup — CA: ${ca.deletedCount}, raw_news: ${rn.deletedCount}`
-      );
-    } catch (err) {
-      console.warn("⚠️ Weekly cleanup failed:", err.message);
-    }
+  // ── Error handlers (registered AFTER all routes including /billing) ───
+  app.use((req, res) => res.status(404).json({ error: "Route not found" }));
+  app.use((err, req, res, next) => {
+    if (err.code === "LIMIT_FILE_SIZE")
+      return res
+        .status(413)
+        .json({ error: "File too large. Maximum allowed size is 5MB." });
+    console.error("❌ Server error:", err.message);
+    res.status(500).json({ error: "Internal server error" });
   });
 });
 
