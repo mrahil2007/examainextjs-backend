@@ -864,14 +864,55 @@ const calculateCoins = (score, total, timeTaken, streak) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CURRENT AFFAIRS
+// PRIVACY HELPERS — Strip PII (email/phone) from public-facing userName
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// NOTE: Released Android app sends ?lang=hinglish for Hindi/Hinglish users.
-// We accept the param for backwards compatibility but always serve English
-// content (the released app's parser is happy as long as the response shape
-// is preserved). Hinglish generation will be re-introduced or fully removed
-// in a future app release.
+// The released Android app reads `userName` from /leaderboard and /user
+// responses and shows it to OTHER users. Some users signed up with phone or
+// email auth without ever setting a display name, so their userName field
+// got stored as their phone or email — leaking PII to other users.
+//
+// This helper detects emails, phone numbers, empty values, and placeholder
+// strings, replacing them with a stable anonymous handle like "Student3F8A2B"
+// derived from the userId. The response shape stays IDENTICAL, only the
+// VALUE of userName changes, so released-app users will not crash.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHONE_REGEX = /^\+?[\d\s\-()]{7,}$/;
+
+const isPiiUserName = (name) => {
+  if (!name || typeof name !== "string") return true;
+  const trimmed = name.trim();
+  if (!trimmed) return true;
+  const lower = trimmed.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "user")
+    return true;
+  if (EMAIL_REGEX.test(trimmed)) return true;
+  if (PHONE_REGEX.test(trimmed)) return true;
+  return false;
+};
+
+const buildAnonHandle = (userId) => {
+  const idStr = (userId || "").toString();
+  const slice = idStr
+    .slice(-6)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  const padded = (slice + "XXXXXX").slice(0, 6);
+  return `Student${padded}`;
+};
+
+const getSafeUserName = (user) => {
+  if (!user) return "Student";
+  if (isPiiUserName(user.userName)) {
+    return buildAnonHandle(user.userId || user._id);
+  }
+  return user.userName.trim();
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CURRENT AFFAIRS
 // ═══════════════════════════════════════════════════════════════════════════
 
 const fetchAndStoreRawNews = async () => {
@@ -1140,10 +1181,16 @@ app.post("/user/sync", async (req, res) => {
   const { userId, userName, exam, xp = 0 } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   try {
+    // Privacy: if incoming userName is a phone/email/empty, replace it before
+    // storing — prevents new pollution. Real userName the user typed is kept.
+    const safeName = isPiiUserName(userName)
+      ? buildAnonHandle(userId)
+      : userName.trim();
+
     await getUsers().updateOne(
       { userId },
       {
-        $set: { userName, exam, updatedAt: new Date() },
+        $set: { userName: safeName, exam, updatedAt: new Date() },
         $inc: { xp },
         $setOnInsert: {
           coins: 0,
@@ -1164,7 +1211,17 @@ app.get("/user/:userId", async (req, res) => {
   try {
     const user = await getUsers().findOne({ userId: req.params.userId });
     if (!user) return res.status(404).json({ error: "User not found" });
-    res.json(user);
+
+    // Privacy: strip PII fields before returning. The released app reads
+    // userName / coins / streak / xp / exam / lastPlayedDate / createdAt /
+    // updatedAt — all preserved. We drop sensitive/internal fields entirely.
+    const { email, phone, phoneNumber, fcmToken, _id, ...rest } = user;
+    const safeUser = {
+      ...rest,
+      userName: getSafeUserName(user),
+    };
+
+    res.json(safeUser);
   } catch {
     res.status(500).json({ error: "Failed to load user" });
   }
@@ -1335,6 +1392,14 @@ app.get("/quiz/history/:userId", async (req, res) => {
 });
 
 // ── Leaderboard ───────────────────────────────────────────────────────────────
+//
+// Response shape (UNCHANGED — released app depends on it):
+//   { leaderboard: [{ userId, userName, coins, streak }], userRank }
+//
+// Privacy fix: `userName` is sanitized via getSafeUserName() so any user that
+// has email/phone/empty stored as userName will show as "StudentXXXXXX"
+// instead of leaking their personal info to other users.
+// ═══════════════════════════════════════════════════════════════════════════
 app.get("/leaderboard/:exam", async (req, res) => {
   const { exam } = req.params;
   const userId = req.query.userId;
@@ -1343,12 +1408,23 @@ app.get("/leaderboard/:exam", async (req, res) => {
       .find({ exam, coins: { $gt: 0 } })
       .sort({ coins: -1 })
       .limit(20)
-      .project({ userId: 1, userName: 1, coins: 1, streak: 1 })
+      .project({ userId: 1, userName: 1, coins: 1, streak: 1, _id: 0 })
       .toArray();
+
+    // Sanitize userName before exposing — same shape, just PII stripped
+    const sanitizedLeaderboard = topUsers.map((user) => ({
+      userId: user.userId,
+      userName: getSafeUserName(user),
+      coins: user.coins || 0,
+      streak: user.streak || 0,
+    }));
 
     let userRank = null;
     if (userId) {
-      const userDoc = await getUsers().findOne({ userId });
+      const userDoc = await getUsers().findOne(
+        { userId },
+        { projection: { coins: 1, _id: 0 } }
+      );
       const userCoins = userDoc?.coins || 0;
       const higherCount = await getUsers().countDocuments({
         exam,
@@ -1357,7 +1433,7 @@ app.get("/leaderboard/:exam", async (req, res) => {
       userRank = higherCount + 1;
     }
 
-    res.json({ leaderboard: topUsers, userRank });
+    res.json({ leaderboard: sanitizedLeaderboard, userRank });
   } catch (err) {
     console.error("❌ Leaderboard error:", err.message);
     res.status(500).json({ error: "Failed to fetch leaderboard" });
@@ -1365,15 +1441,6 @@ app.get("/leaderboard/:exam", async (req, res) => {
 });
 
 // ── Current Affairs ───────────────────────────────────────────────────────────
-//
-// Backwards-compatible shape for the released app:
-//   { date, exam, lang, affairs: [{ id, category, headline, summary,
-//     importance, examRelevance, tags, source, pubDate }], cached, total }
-//
-// `lang` query param is accepted ("english" | "hinglish") but currently always
-// serves English content. Released-app users who chose Hinglish will see
-// English content with no crash, since all expected fields are present.
-// ═══════════════════════════════════════════════════════════════════════════
 app.get("/current-affairs/:exam", async (req, res) => {
   const { exam } = req.params;
   const lang = req.query.lang === "hinglish" ? "hinglish" : "english";
@@ -1399,7 +1466,6 @@ app.get("/current-affairs/:exam", async (req, res) => {
       });
     }
 
-    // Build response in the shape the released app expects
     const affairs = rawDoc.items.map((item, i) => ({
       id: `ca_${i + 1}`,
       category: "National",
