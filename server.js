@@ -171,12 +171,19 @@ const parseRSSWithFallback = async (url) => {
 };
 
 const RSS_NEWS_SOURCES = [
-  "https://www.pib.gov.in/RssMain.aspx?ModID=6&reg=3&lang=2",
-  "https://www.thehindu.com/news/national/?service=rss",
-  "https://indianexpress.com/feed/",
+  // PIB English — confirmed working with reg=3 suffix
+  "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3&reg=3",
+  "https://pib.gov.in/RssMain.aspx?ModId=18&Lang=1&Regid=3&reg=3",
+  // The Hindu
+  "https://www.thehindu.com/news/national/feeder/default.rss",
+  // Indian Express
+  "https://indianexpress.com/section/india/feed/",
+  // Times of India
   "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms",
-  "https://www.pib.gov.in/RssMain.aspx?ModId=6&Lang=2&Regid=3&reg=3",
-  "",
+  // Supplements
+  "https://prsindia.org/feed",
+  "https://www.livemint.com/rss/news",
+  "https://www.downtoearth.org.in/rss/news",
 ];
 
 const fetchRSSFallback = async (query) => {
@@ -935,15 +942,30 @@ const fetchAndStoreRawNews = async () => {
   const seen = new Set();
 
   const sources = [
-    "https://pib.gov.in/RssMain.aspx",
-    "https://www.thehindu.com/news/national/?service=rss",
-    "https://www.thehindu.com/business/?service=rss",
-    "https://www.thehindu.com/sci-tech/?service=rss",
-    "https://indianexpress.com/feed/",
+    // PIB English — both press releases and features (reg=3 unlocks English)
+    "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3&reg=3",
+    "https://pib.gov.in/RssMain.aspx?ModId=18&Lang=1&Regid=3&reg=3",
+    // The Hindu — multiple sections
+    "https://www.thehindu.com/news/national/feeder/default.rss",
+    "https://www.thehindu.com/business/feeder/default.rss",
+    "https://www.thehindu.com/sci-tech/feeder/default.rss",
+    "https://www.thehindu.com/sport/feeder/default.rss",
+    "https://www.thehindu.com/opinion/editorial/feeder/default.rss",
+    // Indian Express
+    "https://indianexpress.com/section/india/feed/",
+    "https://indianexpress.com/section/explained/feed/",
+    "https://indianexpress.com/section/business/feed/",
+    // Times of India
     "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms",
     "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms",
-    "https://www.thehindu.com/sport/?service=rss",
-    "https://pib.gov.in/RssMain.aspx?ModID=6",
+    // Hindustan Times
+    "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
+    // Policy / Parliament (replacement for old dead URLs)
+    "https://prsindia.org/feed",
+    // Environment — UPSC GS-3 gold
+    "https://www.downtoearth.org.in/rss/news",
+    // Economy
+    "https://www.livemint.com/rss/news",
   ];
 
   for (const url of sources) {
