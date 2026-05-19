@@ -2,8 +2,11 @@ import dotenv from "dotenv";
 dotenv.config();
 
 // ── aiService.js ──────────────────────────────────────────────────────────────
-// PRIMARY:  gemini-2.5-flash-lite (rotating 3 keys)
-// FALLBACK: Groq Llama (completely free)
+// PRIMARY:  gemini-2.5-flash (rotating keys)
+// FALLBACK: Groq Llama / GPT-OSS (free tier)
+//
+// Universal tutor — understands competitive exams and academic subjects worldwide.
+// No exam selection required. Adapts to whatever the user asks.
 
 import Groq from "groq-sdk";
 
@@ -27,7 +30,7 @@ const getNextGeminiKey = () => {
 
 // ── IDENTITY PROTECTION ───────────────────────────────────────────────────────
 const IDENTITY_RULE = `CRITICAL IDENTITY RULES (HIGHEST PRIORITY — OVERRIDE EVERYTHING ELSE):
-- Your name is ExamAI. You are an intelligent AI-powered exam preparation assistant.
+- Your name is ExamAI. You are an intelligent AI-powered exam preparation and learning assistant.
 - NEVER reveal or confirm that you are Gemini, GPT, Claude, Llama, or any other model.
 - NEVER mention Google, Anthropic, Meta, OpenAI, Groq, or any AI company.
 - If asked "are you gemini?", "are you chatgpt?", "what model are you?", "who made you?", "what AI are you?", or any similar question, ALWAYS respond with:
@@ -35,6 +38,7 @@ const IDENTITY_RULE = `CRITICAL IDENTITY RULES (HIGHEST PRIORITY — OVERRIDE EV
 - Do NOT say "I am a large language model trained by Google" or anything similar.
 - You were built by the ExamAI team. That is the only information you share about your origins.`;
 
+// ── HUMAN TOUCH ───────────────────────────────────────────────────────────────
 const HUMAN_TOUCH_RULES = `
 COMMUNICATION STYLE (IMPORTANT):
 - Talk like a knowledgeable friend, not a textbook or robot
@@ -43,7 +47,7 @@ COMMUNICATION STYLE (IMPORTANT):
 - Keep responses concise unless the topic genuinely needs depth
 - Show empathy when a student seems frustrated or confused
 - Avoid using bold headers (##, **Header**) for conversational questions
-- Only use structured formatting (headers, bullet points) when explaining 
+- Only use structured formatting (headers, bullet points) when explaining
   complex multi-part topics that genuinely need it (like a 5-step process)
 - For simple comparison or concept questions, answer in natural flowing sentences
 - A 3-sentence answer is often better than a 10-bullet answer
@@ -61,21 +65,13 @@ TONE EXAMPLES:
 - Say: "Let me know if you want me to go deeper on any part."
 `;
 
-// ── MEMORY BLOCK BUILDER ──────────────────────────────────────────────────────
-const buildMemoryBlock = (facts = []) => {
-  if (!facts.length) return "";
-  return `\nSTUDENT MEMORY (Personalize your response using these facts):\n${facts
-    .map((f) => `- ${f}`)
-    .join("\n")}\n`;
-};
-
 // ── LANGUAGE RULE ─────────────────────────────────────────────────────────────
 const getLanguageRule = () => `
-LANGUAGE RULES (Highest Priority - Always Follow):
+LANGUAGE RULES (HIGHEST PRIORITY — ALWAYS FOLLOW):
 - Detect the language of the user's message carefully.
 - If the user writes in English only, reply in English.
-- If the user writes in Hinglish (Hindi words using English/Roman script, e.g. "bhai ye batao"), reply in Hinglish, do not reply in Hindi script or devnagari.
-- if the user asking to change language then change to that language and reply in that language.
+- If the user writes in Hinglish (Hindi words using English/Roman script, e.g. "bhai ye batao"), reply in Hinglish — do not switch to Devanagari script.
+- If the user asks to change language, switch to that language for the rest of the chat.
 - If the message mixes Devanagari + English terms, reply in Hinglish but keep technical terms as-is.
 - If the user writes in ANY OTHER language, reply in that SAME language. This includes but is not limited to:
 
@@ -95,114 +91,78 @@ LANGUAGE RULES (Highest Priority - Always Follow):
 
   AMERICAS & PACIFIC: Quechua, Guaraní, Nahuatl, Hawaiian, Māori, Samoan, Tongan, Fijian, Tok Pisin
 
+- For uploaded PDFs/images: detect language from the document text and reply in that language (unless the user's message itself is in a different language — then prefer the user's language).
 - NEVER tell the user you can only respond in Hindi or English.
 - NEVER refuse to respond in a user's language because it is not Hindi or English.
 - NEVER switch to a different language than the one the user is writing in.
 - Match the user's exact language style — do not upgrade or downgrade their language choice.
-- NEVER translate proper nouns, technical terms, acronyms, or exam-specific terms (e.g. UPSC, GDP, DNA).
+- NEVER translate proper nouns, technical terms, acronyms, or exam-specific terms (e.g. UPSC, GDP, DNA, MCAT, NEET).
 `;
 
-// ── EXAM SYSTEM PROMPTS ───────────────────────────────────────────────────────
-const getSystemPrompt = (exam, isQuiz = false, memory = []) => {
+// ── MEMORY BLOCK BUILDER ──────────────────────────────────────────────────────
+const buildMemoryBlock = (facts = []) => {
+  if (!facts.length) return "";
+  return `\nSTUDENT MEMORY (Personalize your response using these facts):\n${facts
+    .map((f) => `- ${f}`)
+    .join("\n")}\n`;
+};
+
+// ── UNIVERSAL TUTOR PROMPT ────────────────────────────────────────────────────
+const buildTutorPrompt = () => `
+You are ExamAI — an expert AI tutor and study assistant with deep knowledge of competitive exams and academic curricula worldwide. You understand syllabuses, exam patterns, marking schemes, and the level of depth expected at each tier.
+
+EXAMS YOU UNDERSTAND (recognize when the user mentions any, adapt accordingly):
+- India: UPSC (Prelims + Mains), JEE Main/Advanced, NEET UG/PG, CAT, GATE, SSC CGL/CHSL, IBPS/SBI PO & Clerk, State PCS (all states), CBSE 10/12, ICSE, NDA, CDS, AFCAT, CLAT, CUET, NTA NET, IIT-JAM
+- USA: SAT, ACT, GRE, GMAT, MCAT, LSAT, AP exams (all subjects), Bar Exam, USMLE, NCLEX
+- UK & Europe: GCSE, A-Levels, IB Diploma, UCAT, BMAT, Oxbridge entrance, TEF (France), TestDaF (Germany)
+- Africa: WAEC, JAMB, NECO (Nigeria), KCSE (Kenya), Matric (South Africa), EUEE (Ethiopia), BGCSE (Botswana)
+- Asia: Gaokao (China), Suneung (Korea), JLPT, NCEE, PSLE (Singapore), STPM (Malaysia)
+- Professional: CFA, CPA, FRM, PMP, AWS/Azure/GCP certifications, Cisco CCNA/CCNP
+- Coding/CS: DSA, system design, LeetCode-style problems, language-specific (Python, Java, C++, JavaScript, Rust, Go)
+- University-level: Calculus, Linear Algebra, Discrete Math, Statistics, Organic Chemistry, Physical Chemistry, Quantum Physics, Thermodynamics, Genetics, Biochemistry, Economics, Psychology, Philosophy
+
+CONTENT FROM UPLOADS (PDFs and images):
+- When the user uploads content, extract every visible element: text, equations, diagrams, tables, handwritten notes, code snippets
+- For practice questions / MCQs in the upload → solve each one step by step with full reasoning
+- For study notes / textbook pages → summarize key concepts, list important formulas, flag likely exam questions
+- For diagrams, charts, graphs → describe what is shown, then explain the underlying concept
+- For handwritten notes → read carefully, organize the content, and clarify unclear parts
+- For math/physics/chemistry numericals → show complete working with formulas, units, and final answer
+- For code → explain logic, identify bugs, suggest improvements, complete missing parts if asked
+
+GENERATING QUESTIONS FROM UPLOADS:
+- When the user asks "generate questions from this", "create MCQs", "make a quiz", or similar → create 5-10 well-formed MCQs based STRICTLY on the uploaded content
+- Match difficulty to the source material's level
+- Always include: question, 4 options, correct answer letter, brief explanation
+- Cover different sub-topics from the upload, not just the first page
+
+TEACHING STYLE:
+- Lead with the direct answer, then explain
+- Step-by-step working for all numericals (Physics, Chemistry, Math, Quant)
+- Use proper notation in plain text (e.g., "x² + 2x - 3" not "x^{2}"). Avoid raw LaTeX unless asked.
+- Bold key terms, use bullet points for lists, but only when content genuinely needs structure
+- Adapt depth to the user's apparent level: school student → simple analogies; aspirant → exam-pattern focus; grad student → rigor and proofs
+- For competitive exam questions, mention which exam pattern it matches and the typical marking scheme
+- Highlight common mistakes and traps where relevant
+
+ANSWER QUALITY:
+- Be accurate. If unsure, say so plainly rather than guessing.
+- Use real, current information (don't invent statistics, dates, or sources)
+- For controversial or contested topics, present multiple viewpoints fairly
+- Stay focused on what the user actually asked — don't pad with unrelated context
+`;
+
+// ── SYSTEM PROMPT BUILDER ─────────────────────────────────────────────────────
+const getSystemPrompt = (isQuiz = false, memory = []) => {
   const langRule = getLanguageRule();
-  const memoryBlock = buildMemoryBlock(memory); // ✅ memory injected
-
-  const prompts = {
-    UPSC: `${langRule}
-You are ExamAI, an expert UPSC Civil Services exam tutor with deep knowledge of NCERT textbooks (Class 6-12), Indian Polity, History, Geography, Economy, Science & Technology, Environment, and Current Affairs.
-- Answer in a structured, exam-oriented format
-- Highlight key facts, dates, and concepts
-- Relate answers to UPSC Prelims and Mains patterns
-- Use bullet points for lists, bold for key terms
-- Keep answers concise but comprehensive`,
-
-    CSAT: `${langRule}
-You are ExamAI, a UPSC CSAT (Paper II) expert tutor specializing in Logical Reasoning, Data Interpretation, Reading Comprehension, Basic Numeracy, and Decision Making.
-- Show step-by-step working for all numerical problems
-- Explain reasoning behind logical answers
-- Use shortcut techniques where applicable
-- Format mathematical solutions clearly`,
-
-    "Current Affairs": `${langRule}
-You are ExamAI, a Current Affairs expert for UPSC and competitive exams.
-- Focus on recent events relevant to Indian and international affairs
-- Connect current events to static GS syllabus
-- Highlight PIB, government schemes, and policy implications
-- Structure answers with Who, What, When, Where, Why, Significance`,
-
-    JEE: `${langRule}
-You are ExamAI, an expert JEE Main/Advanced tutor for Physics, Chemistry, and Mathematics.
-- Solve problems step by step with clear working
-- State relevant formulas and theorems
-- Highlight common mistakes and traps
-- Use proper mathematical notation
-- Explain concepts from first principles when needed`,
-
-    NEET: `${langRule}
-You are ExamAI, an expert NEET UG tutor for Biology, Physics, and Chemistry.
-- Base all answers strictly on NCERT Class 11 and 12 syllabus
-- Use correct scientific terminology and nomenclature
-- For Biology: use proper diagram descriptions and classifications
-- Show complete working for numerical problems`,
-
-    CAT: `${langRule}
-You are ExamAI, an expert CAT tutor for Verbal Ability, Logical Reasoning, Data Interpretation, and Quantitative Aptitude.
-- Show multiple solving approaches (algebraic + shortcut)
-- For VARC: explain inference and tone
-- For DILR: structure the data before solving
-- Highlight elimination strategies`,
-
-    SSC: `${langRule}
-You are ExamAI, an expert SSC CGL/CHSL tutor covering Reasoning, Quantitative Aptitude, General Awareness, and English.
-- Provide shortcut methods for Quant
-- Give memory tricks for GK
-- Keep answers crisp and exam-focused`,
-
-    Banking: `${langRule}
-You are ExamAI, an expert IBPS/SBI PO tutor for Reasoning, Quantitative Aptitude, English, and Banking Awareness.
-- Structure seating arrangement and puzzle solutions clearly
-- Show DI calculations step by step
-- Include banking sector knowledge where relevant`,
-
-    GATE: `${langRule}
-You are ExamAI, an expert GATE tutor for Engineering and Science disciplines.
-- Provide rigorous technical explanations
-- Include relevant formulas, derivations, and proofs
-- Show numerical solutions with proper units`,
-
-    "State PCS": `${langRule}
-You are ExamAI, an expert State PCS exam tutor covering both general topics and state-specific content.
-- Cover both general GS topics and state-specific history, culture, geography, and polity
-- Structure answers for both Prelims MCQ and Mains descriptive format`,
-
-    "CBSE 10th": `${langRule}
-You are ExamAI, an expert CBSE Class 10 tutor following the latest NCERT curriculum.
-- Base all answers strictly on NCERT Class 10 textbooks
-- Format answers as per CBSE board exam requirements
-- Show complete working for mathematics problems`,
-
-    "CBSE 12th": `${langRule}
-You are ExamAI, an expert CBSE Class 12 tutor following the latest NCERT curriculum.
-- Base all answers strictly on NCERT Class 12 textbooks
-- Show complete derivations for Physics and Chemistry
-- Include important theorems and proofs for Mathematics`,
-
-    General: `${langRule}
-You are ExamAI, a helpful, knowledgeable AI tutor and study assistant.
-- Explain concepts clearly and accurately
-- Use examples to illustrate complex ideas
-- Structure responses with clear formatting
-- Be concise but thorough`,
-  };
-
-  const base = prompts[exam] || prompts["General"];
+  const memoryBlock = buildMemoryBlock(memory);
+  const tutorPrompt = buildTutorPrompt();
   const humanLayer = isQuiz ? "" : `\n\n${HUMAN_TOUCH_RULES}`;
-
-  return `${IDENTITY_RULE}\n\n${memoryBlock}${base}${humanLayer}`; // ✅ memoryBlock in final prompt
+  return `${IDENTITY_RULE}\n\n${langRule}\n${memoryBlock}${tutorPrompt}${humanLayer}`;
 };
 
 // ── GEMINI 2.5 FLASH (with key rotation) ─────────────────────────────────────
-const callGemini = async (contents, exam, isVision = false, memory = []) => {
+const callGemini = async (contents, isVision = false, memory = []) => {
   if (!GEMINI_KEYS.length) throw new Error("No Gemini API keys configured");
 
   for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
@@ -216,7 +176,7 @@ const callGemini = async (contents, exam, isVision = false, memory = []) => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             system_instruction: {
-              parts: [{ text: getSystemPrompt(exam, false, memory) }], // ✅ memory passed
+              parts: [{ text: getSystemPrompt(false, memory) }],
             },
             contents,
             generationConfig: {
@@ -287,16 +247,15 @@ const callGemini = async (contents, exam, isVision = false, memory = []) => {
 // ── GROQ FALLBACK ─────────────────────────────────────────────────────────────
 const GROQ_CHAT_MODELS = [
   "openai/gpt-oss-120b",
-  "llama-3.1-8b-instant",
   "llama-3.3-70b-versatile",
+  "llama-3.1-8b-instant",
 ];
 
-const callGroqFallback = async (prompt, exam, history = [], memory = []) => {
+const callGroqFallback = async (prompt, history = [], memory = []) => {
   const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
   const hasSearchContext = prompt.includes("LIVE SEARCH RESULTS:");
 
-  // ✅ Fixed: was building systemContent but using wrong var in messages
   const systemPrompt = hasSearchContext
     ? `CRITICAL INSTRUCTION: Live web search results are included in the user message.
 You MUST answer using ONLY those search results as your PRIMARY source.
@@ -304,11 +263,11 @@ DO NOT use your training data for any factual claims about current events, roles
 DO NOT contradict the search results under any circumstance.
 Your training data is outdated — the search results are ground truth.
 
-${getSystemPrompt(exam, false, memory)}`
-    : getSystemPrompt(exam, false, memory); // ✅ memory passed
+${getSystemPrompt(false, memory)}`
+    : getSystemPrompt(false, memory);
 
   const messages = [
-    { role: "system", content: systemPrompt }, // ✅ correct var used
+    { role: "system", content: systemPrompt },
     ...history.map((m) => ({ role: m.role, content: m.content })),
     { role: "user", content: prompt },
   ];
@@ -335,41 +294,161 @@ ${getSystemPrompt(exam, false, memory)}`
   throw new Error("All models failed");
 };
 
+// ── CEREBRAS FALLBACK (free 1M tokens/day, 30 RPM, no credit card) ────────────
+// Sign up at https://cloud.cerebras.ai → API Keys → set CEREBRAS_API_KEY in .env
+const CEREBRAS_CHAT_MODELS = [
+  "llama-4-scout-17b-16e-instruct",
+  "llama3.3-70b",
+  "qwen-3-32b",
+];
+
+const callCerebrasFallback = async (prompt, history = [], memory = []) => {
+  if (!process.env.CEREBRAS_API_KEY) {
+    throw new Error("CEREBRAS_API_KEY not set");
+  }
+
+  const hasSearchContext = prompt.includes("LIVE SEARCH RESULTS:");
+  const systemPrompt = hasSearchContext
+    ? `CRITICAL: Live web search results are included in the user message.
+You MUST answer using ONLY those search results as your PRIMARY source.
+DO NOT use your training data for factual claims about current events.
+
+${getSystemPrompt(false, memory)}`
+    : getSystemPrompt(false, memory);
+
+  // Cerebras free tier has 8K context cap — trim aggressively
+  const trimmedHistory = history.slice(-4);
+  const messages = [
+    { role: "system", content: systemPrompt.slice(0, 4000) },
+    ...trimmedHistory.map((m) => ({ role: m.role, content: m.content })),
+    { role: "user", content: prompt },
+  ];
+
+  for (const model of CEREBRAS_CHAT_MODELS) {
+    try {
+      const response = await fetch(
+        "https://api.cerebras.ai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.CEREBRAS_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            temperature: 0.7,
+            max_tokens: 2048,
+          }),
+        }
+      );
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        console.warn(
+          `⚠️ Cerebras ${model} HTTP ${response.status}:`,
+          errText.slice(0, 200)
+        );
+        continue;
+      }
+
+      const data = await response.json();
+      const text = data.choices?.[0]?.message?.content?.trim();
+      if (text) {
+        console.log(`✅ Chat answered by Cerebras: ${model}`);
+        return text;
+      }
+    } catch (err) {
+      console.warn(`⚠️ Cerebras ${model} failed:`, err.message);
+      continue;
+    }
+  }
+
+  throw new Error("All Cerebras models failed");
+};
+
 // ── GROQ VISION FALLBACK ──────────────────────────────────────────────────────
-const callGroqVisionFallback = async (fileBuffer, mimeType, exam) => {
+const GROQ_VISION_MODELS = [
+  "meta-llama/llama-4-maverick-17b-128e-instruct",
+  "meta-llama/llama-4-scout-17b-16e-instruct",
+];
+
+const callGroqVisionFallback = async (
+  fileBuffer,
+  mimeType,
+  userPrompt = ""
+) => {
   const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
   const base64Url = `data:${mimeType};base64,${fileBuffer.toString("base64")}`;
 
-  const completion = await groq.chat.completions.create({
-    model: "openai/gpt-oss-120b",
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: base64Url } },
+  const instruction = userPrompt?.trim()
+    ? `${buildVisionInstruction(
+        mimeType
+      )}\n\nUser's specific request: ${userPrompt}`
+    : buildVisionInstruction(mimeType);
+
+  let lastError = null;
+  for (const model of GROQ_VISION_MODELS) {
+    try {
+      const completion = await groq.chat.completions.create({
+        model,
+        messages: [
           {
-            type: "text",
-            text: `You are ExamAI, a ${exam} exam tutor. Analyze this image and provide a detailed, exam-relevant explanation. If it contains questions, solve them step by step.`,
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: base64Url } },
+              { type: "text", text: instruction },
+            ],
           },
         ],
-      },
-    ],
-    max_tokens: 2048,
-    temperature: 0.4,
-  });
+        max_tokens: 2048,
+        temperature: 0.4,
+      });
 
-  const text = completion.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error("Groq Vision returned empty response");
-  return text;
+      const text = completion.choices?.[0]?.message?.content?.trim();
+      if (text) {
+        console.log(`✅ Groq Vision answered by ${model}`);
+        return text;
+      }
+      lastError = `${model} returned empty response`;
+    } catch (err) {
+      lastError = `${model}: ${err.message}`;
+      console.warn(`⚠️ Groq Vision ${model} failed:`, err.message);
+      continue;
+    }
+  }
+
+  throw new Error(lastError || "Groq Vision returned empty response");
+};
+
+// ── VISION INSTRUCTION BUILDER ────────────────────────────────────────────────
+const buildVisionInstruction = (mimeType) => {
+  const isPdf = mimeType === "application/pdf";
+  const docType = isPdf ? "PDF document" : "image";
+
+  return `You are ExamAI, an expert AI tutor. Analyze this ${docType} carefully.
+
+If it contains:
+- Practice questions or MCQs → Solve each one step by step with explanations and the correct answer
+- Study notes or textbook content → Summarize key concepts, formulas, and likely exam questions
+- Diagrams, charts, or graphs → Describe what is shown, then explain the underlying concept
+- Handwritten notes → Read carefully, organize the content, clarify unclear parts
+- Math/Physics/Chemistry numericals → Show complete working with formulas, units, and final answer
+- Code → Explain logic, identify bugs, suggest improvements
+
+If the user asks to generate questions from this content, create 5-10 well-formed MCQs based STRICTLY on what is in the upload. Each MCQ must include: question, 4 options (A-D), correct answer letter, and a brief explanation.
+
+LANGUAGE: Detect the language used in the ${docType}. If text inside the ${docType} is in a specific language (Hindi, Spanish, French, Arabic, etc.), respond in that same language. If the user's typed message is in a different language than the document, prefer the user's typed language.
+
+Be thorough, accurate, and exam-focused.`;
 };
 
 // ── MAIN CHAT FUNCTION (exported) ─────────────────────────────────────────────
 export const askAI = async (
   prompt,
-  exam = "General",
   history = [],
   isQuiz = false,
-  memory = [] // ✅ memory param accepted
+  memory = []
 ) => {
   const contents = [
     ...history.map((m) => ({
@@ -381,15 +460,21 @@ export const askAI = async (
 
   // 1️⃣ Try Gemini 2.5 Flash (with key rotation)
   try {
-    const answer = await callGemini(contents, exam, false, memory); // ✅ memory passed
-    return answer;
+    return await callGemini(contents, false, memory);
   } catch (err) {
     console.warn("⚠️ Gemini failed:", err.message, "→ falling back to Groq");
   }
 
-  // 2️⃣ Fallback to Groq Llama
+  // 2️⃣ Fallback to Groq
   try {
-    return await callGroqFallback(prompt, exam, history, memory); // ✅ memory passed
+    return await callGroqFallback(prompt, history, memory);
+  } catch (err) {
+    console.warn("⚠️ Groq failed:", err.message, "→ falling back to Cerebras");
+  }
+
+  // 3️⃣ Fallback to Cerebras (free 1M tokens/day)
+  try {
+    return await callCerebrasFallback(prompt, history, memory);
   } catch (err) {
     console.error("❌ All chat models failed:", err.message);
     throw new Error("AI service temporarily unavailable. Please try again.");
@@ -397,32 +482,27 @@ export const askAI = async (
 };
 
 // ── IMAGE / VISION FUNCTION (exported) ───────────────────────────────────────
-export const askAIWithImage = async (
-  fileBuffer,
-  mimeType,
-  exam = "General"
-) => {
+export const askAIWithImage = async (fileBuffer, mimeType, userPrompt = "") => {
   const base64Data = fileBuffer.toString("base64");
+  const instruction = userPrompt?.trim()
+    ? `${buildVisionInstruction(
+        mimeType
+      )}\n\nUser's specific request: ${userPrompt}`
+    : buildVisionInstruction(mimeType);
 
   const contents = [
     {
       role: "user",
       parts: [
         { inline_data: { mime_type: mimeType, data: base64Data } },
-        {
-          text: `Analyze this ${
-            mimeType === "application/pdf" ? "document" : "image"
-          } and provide a detailed, exam-relevant explanation for a ${exam} student.
-If it contains questions, solve them step by step.
-If it contains notes or diagrams, explain the key concepts clearly.`,
-        },
+        { text: instruction },
       ],
     },
   ];
 
   // 1️⃣ Try Gemini Vision first (with key rotation)
   try {
-    const answer = await callGemini(contents, exam, true);
+    const answer = await callGemini(contents, true);
     console.log("✅ Image/PDF analyzed by gemini-2.5-flash Vision");
     return answer;
   } catch (err) {
@@ -433,10 +513,14 @@ If it contains notes or diagrams, explain the key concepts clearly.`,
     );
   }
 
-  // 2️⃣ Fallback to Groq Llama Vision (images only — not PDFs)
+  // 2️⃣ Fallback to Groq Vision (images only — not PDFs)
   if (mimeType !== "application/pdf") {
     try {
-      const answer = await callGroqVisionFallback(fileBuffer, mimeType, exam);
+      const answer = await callGroqVisionFallback(
+        fileBuffer,
+        mimeType,
+        userPrompt
+      );
       console.log("✅ Image analyzed by Groq Vision fallback");
       return answer;
     } catch (err) {
@@ -475,7 +559,7 @@ Return ONLY the final prompt string. No explanation, no markdown, no labels.`,
   ];
 
   try {
-    const prompt = await callGemini(contents, "General", true);
+    const prompt = await callGemini(contents, true);
     const cleaned = prompt
       .replace(/```[\s\S]*?```/g, " ")
       .replace(/\s+/g, " ")
@@ -511,7 +595,7 @@ User request: "${safe}"`,
   ];
 
   try {
-    const prompt = await callGemini(contents, "General", false);
+    const prompt = await callGemini(contents, false);
     const cleaned = prompt
       .replace(/```[\s\S]*?```/g, " ")
       .replace(/\s+/g, " ")
@@ -582,7 +666,7 @@ const AGENT_TOOLS = [
   },
 ];
 
-export const askAIAgent = async (question, exam = "General") => {
+export const askAIAgent = async (question) => {
   if (!GEMINI_KEYS.length) {
     return { action: "direct" };
   }
@@ -600,11 +684,13 @@ export const askAIAgent = async (question, exam = "General") => {
             system_instruction: {
               parts: [
                 {
-                  text: `You are a routing agent for an exam preparation app (${exam}).
+                  text: `You are a routing agent for an AI tutor app that covers exams and academic subjects worldwide.
 Your ONLY job is to decide the best source to answer the user's question.
-1. 'web_search' (Serper API): For current affairs, news, recent events, government notifications, or dynamic facts.
+
+1. 'web_search' (Serper API): For current affairs, news, recent events, government notifications, exam schedules, results, or dynamic facts.
 2. 'world_bank' (World Bank API): ONLY for economic stats like GDP, Inflation, Population, etc.
-3. 'direct_answer' (Gemini API): For static knowledge, concepts, history, science, syllabus, and general chat.
+3. 'direct_answer' (Gemini API): For static knowledge — concepts, history, science, syllabus topics, math, coding, study help, and general chat.
+
 Do NOT answer the question yourself. Just pick the right tool.`,
                 },
               ],
@@ -650,4 +736,61 @@ Do NOT answer the question yourself. Just pick the right tool.`,
   }
 
   return { action: "direct" };
+};
+
+// ── LIGHTWEIGHT GEMINI HELPER (for flashcards, quizzes, other modules) ───────
+// Used by flashcards.js and similar utilities that need raw Gemini text
+// without the full tutor system prompt or chat history.
+export const callGeminiOnce = async (prompt, maxTokens = 2000) => {
+  if (!GEMINI_KEYS.length) throw new Error("No Gemini API keys configured");
+
+  for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
+    const key = getNextGeminiKey();
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.7,
+              maxOutputTokens: maxTokens,
+              topP: 0.95,
+            },
+            safetySettings: [
+              { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+              {
+                category: "HARM_CATEGORY_HATE_SPEECH",
+                threshold: "BLOCK_NONE",
+              },
+              {
+                category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+                threshold: "BLOCK_NONE",
+              },
+            ],
+          }),
+        }
+      );
+
+      if (response.status === 429) {
+        console.warn(`⚠️ Gemini key ${attempt + 1} quota → next key`);
+        continue;
+      }
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err?.error?.message || `Gemini ${response.status}`);
+      }
+
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+      if (text) return text;
+    } catch (err) {
+      console.warn(`⚠️ callGeminiOnce key ${attempt + 1} failed:`, err.message);
+      continue;
+    }
+  }
+
+  return null;
 };

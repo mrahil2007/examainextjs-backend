@@ -5,6 +5,7 @@
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import { initializeFlashcards, cleanupOldFlashcardData } from "./flashcards.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,10 +24,7 @@ import {
 import Groq from "groq-sdk";
 import { MongoClient, ObjectId } from "mongodb";
 import admin from "firebase-admin";
-import { initFirebase, startJobCron } from "./JobFetcher.js";
 import cron from "node-cron";
-import createJobRouter from "./JobRouter.js";
-import createResumeRouter from "./ResumeBuilder.js";
 import { initializeBilling } from "./billing/index.js";
 
 if (!process.env.GROQ_API_KEY) {
@@ -66,14 +64,16 @@ export const sendPushNotification = async (
     await admin.messaging().send({
       token,
       notification: { title, body },
-      data: { type },
+      data: { type, timestamp: String(Date.now()) },
       android: {
         priority: "high",
         notification: {
           channelId:
-            type === "job"
-              ? "job_alerts"
-              : type === "current_affairs"
+            type === "quiz_nudge"
+              ? "quiz_alerts"
+              : type === "current_affairs_morning" ||
+                type === "current_affairs_evening" ||
+                type === "current_affairs"
               ? "current_affairs"
               : "general",
         },
@@ -114,8 +114,6 @@ const infipApiKey = process.env.INFIP_API_KEY || "";
 if (!infipApiKey)
   console.warn("⚠️  INFIP_API_KEY not set — image generation will fail.");
 
-initFirebase();
-
 // ── MongoDB ───────────────────────────────────────────────────────────────────
 let db;
 const client = new MongoClient(process.env.MONGODB_URI);
@@ -123,47 +121,65 @@ const client = new MongoClient(process.env.MONGODB_URI);
 async function connectDB() {
   await client.connect();
   db = client.db("examai");
-  await db.collection("quizzes").createIndex({ topic: 1, exam: 1 });
+  await db.collection("quizzes").createIndex({ topic: 1 });
   await db
     .collection("quiz_results")
-    .createIndex({ userId: 1, exam: 1, topic: 1, quizId: 1 });
-  await db.collection("users").createIndex({ exam: 1, coins: -1 });
+    .createIndex({ userId: 1, topic: 1, quizId: 1 });
+  await db.collection("users").createIndex({ coins: -1 });
+  await db.collection("raw_news").createIndex({ date: 1 });
+  await db
+    .collection("current_affairs_quizzes")
+    .createIndex({ date: 1 }, { unique: true });
   console.log("✅ MongoDB connected");
 }
 
 const getChats = () => db.collection("chats");
 const getQuizResults = () => db.collection("quiz_results");
-const getJobs = () => db.collection("jobs");
 const getUsers = () => db.collection("users");
-const getResumes = () => db.collection("resumes");
 const getMemories = () => db.collection("memories");
 const getQuizzes = () => db.collection("quizzes");
-
-app.use("/jobs", createJobRouter(getJobs));
-app.use("/resume", createResumeRouter(getResumes));
 
 const searchCache = new Map();
 const SEARCH_CACHE_DURATION = 60 * 60 * 1000;
 
-// ── RSS ───────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// RSS — feed sources curated for full-body availability
+// ═══════════════════════════════════════════════════════════════════════════
 import Parser from "rss-parser";
-const rssParser = new Parser({ timeout: 8000 });
+const rssParser = new Parser({
+  timeout: 10000,
+  customFields: {
+    item: [
+      ["content:encoded", "contentEncoded"],
+      ["dc:creator", "creator"],
+    ],
+  },
+});
+
 const parseRSSWithFallback = async (url) => {
   if (url.includes("pib.gov.in")) {
     try {
       const ctrl = new AbortController();
-      const tid = setTimeout(() => ctrl.abort(), 8000);
-      const r = await fetch(url, { signal: ctrl.signal });
+      const tid = setTimeout(() => ctrl.abort(), 10000);
+      const r = await fetch(url, {
+        signal: ctrl.signal,
+        redirect: "follow",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; ExamAI/1.0)",
+          Accept: "application/rss+xml, application/xml, text/xml, */*",
+        },
+      });
       clearTimeout(tid);
       if (!r.ok) return null;
       let xml = await r.text();
+      if (!xml.trim().startsWith("<?xml") && !xml.includes("<rss")) return null;
       xml = xml.replace(
         /&(?!(amp|lt|gt|quot|apos|#\d+|#x[\da-fA-F]+);)/g,
         "&amp;"
       );
       return await rssParser.parseString(xml);
     } catch (err) {
-      console.warn(`[RAW] PIB clean failed: ${err.message}`);
+      console.warn(`[RAW] PIB fetch failed: ${err.message}`);
       return null;
     }
   }
@@ -171,19 +187,12 @@ const parseRSSWithFallback = async (url) => {
 };
 
 const RSS_NEWS_SOURCES = [
-  // PIB English — confirmed working with reg=3 suffix
-  "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3&reg=3",
-  "https://pib.gov.in/RssMain.aspx?ModId=18&Lang=1&Regid=3&reg=3",
-  // The Hindu
-  "https://www.thehindu.com/news/national/feeder/default.rss",
-  // Indian Express
-  "https://indianexpress.com/section/india/feed/",
-  // Times of India
-  "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms",
-  // Supplements
-  "https://prsindia.org/feed",
-  "https://www.livemint.com/rss/news",
-  "https://www.downtoearth.org.in/rss/news",
+  "https://feeds.bbci.co.uk/news/world/rss.xml",
+  "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+  "https://www.aljazeera.com/xml/rss/all.xml",
+  "https://www.reutersagency.com/feed/?best-topics=world&post_type=best",
+  "https://feeds.skynews.com/feeds/rss/world.xml",
+  "https://www.theguardian.com/world/rss",
 ];
 
 const fetchRSSFallback = async (query) => {
@@ -195,10 +204,7 @@ const fetchRSSFallback = async (query) => {
     for (const url of RSS_NEWS_SOURCES) {
       try {
         const feed = await parseRSSWithFallback(url);
-        if (!feed) {
-          console.warn(`[RAW] Skipping ${url}`);
-          continue;
-        }
+        if (!feed) continue;
         const items = (feed.items || [])
           .filter((item) => {
             const text = `${item.title} ${
@@ -256,38 +262,6 @@ const fetchLiveSearchContext = async (query) => {
   }
 };
 
-const WORLD_BANK_INDICATORS = {
-  GDP: "NY.GDP.MKTP.CD",
-  INFLATION: "FP.CPI.TOTL.ZG",
-  POPULATION: "SP.POP.TOTL",
-  LITERACY: "SE.ADT.LITR.ZS",
-  UNEMPLOYMENT: "SL.UEM.TOTL.ZS",
-  POVERTY: "SI.POV.DDAY",
-  LIFE_EXPECTANCY: "SP.DYN.LE00.IN",
-  EXPORTS: "NE.EXP.GNFS.CD",
-  IMPORTS: "NE.IMP.GNFS.CD",
-};
-
-const fetchWorldBankData = async (countryCode, indicator) => {
-  try {
-    const indicatorCode = WORLD_BANK_INDICATORS[indicator];
-    if (!indicatorCode) return "";
-    const response = await fetch(
-      `https://api.worldbank.org/v2/country/${countryCode}/indicator/${indicatorCode}?format=json&mrv=3`
-    );
-    if (!response.ok) return "";
-    const data = await response.json();
-    const records = data?.[1]?.filter((r) => r.value !== null);
-    if (!records?.length) return "";
-    return `WORLD BANK DATA (${indicator} — ${countryCode}):\n${records
-      .map((r) => `  • ${r.date}: ${Number(r.value).toLocaleString()}`)
-      .join("\n")}\nSource: World Bank Open Data`;
-  } catch (err) {
-    console.warn("⚠️ World Bank fetch failed:", err.message);
-    return "";
-  }
-};
-
 // ── AI helpers ────────────────────────────────────────────────────────────────
 const GROQ_MODELS = [
   { id: "llama-3.3-70b-versatile", MaxCompletionTokens: 8000 },
@@ -325,7 +299,7 @@ const callGPT52 = async (prompt, hasContext = false) => {
         model: "gpt-5.4-mini",
         messages: [{ role: "user", content: prompt }],
         temperature: 0.2,
-        max_completion_tokens: 4000 + (hasContext ? CONTEXT_EXTRA_TOKENS : 0),
+        max_completion_tokens: 8000 + (hasContext ? CONTEXT_EXTRA_TOKENS : 0),
       }),
     });
     if (!response.ok) {
@@ -357,7 +331,7 @@ const callGroqWithFallback = async (prompt, hasContext = false) => {
             model: model.id,
             messages: [{ role: "user", content: prompt }],
             temperature: 0.2,
-            max_tokens: 7000,
+            max_tokens: 8000,
           }),
         }
       );
@@ -365,13 +339,6 @@ const callGroqWithFallback = async (prompt, hasContext = false) => {
         console.warn(
           `⚠️ Groq model ${model.id} failed with status: ${response.status}`
         );
-        try {
-          const errorBody = await response.json();
-          console.warn(
-            "⚠️ Groq error body:",
-            JSON.stringify(errorBody, null, 2)
-          );
-        } catch {}
         continue;
       }
       const data = await response.json();
@@ -461,7 +428,9 @@ const extractJSONArray = (text) => {
 
 import { getQuizPrompt } from "./Quizprompts.js";
 
-// ── INFIP image helpers ───────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// INFIP IMAGE HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
 const INFIP_FREE_MODELS = ["flux2-klein-9b", "img3", "img4"];
 const INFIP_API_BASE = "https://api.infip.pro";
 
@@ -641,7 +610,7 @@ const infipEdit = async (buffer, mimetype, prompt, { width, height } = {}) => {
         response_format: "url",
         images: [base64DataUrl],
       }),
-      signal: ctrl,
+      signal: ctrl.signal,
     });
     clearTimeout(tid);
     if (r.ok) {
@@ -712,35 +681,47 @@ const loadMemory = async (userId) => {
   }
 };
 
-const saveMemory = async (userId, conversation, exam) => {
+const callGroqForMemory = async (prompt) => {
+  const response = await fetch(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.1,
+        max_tokens: 500,
+      }),
+    }
+  );
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content?.trim();
+};
+
+const saveMemory = async (userId, conversation) => {
   if (!userId || !conversation?.length) return;
   try {
     const existing = await loadMemory(userId);
     const extractPrompt = `
-You are a memory extraction system for an exam prep app.
-Analyze this conversation and extract key facts about the student.
+You are a memory extraction system for a study app.
+Analyze this conversation and extract key facts about the user.
 
-EXISTING MEMORY (already known):
+EXISTING MEMORY:
 ${existing.length ? existing.map((f) => `- ${f}`).join("\n") : "None yet"}
 
 NEW CONVERSATION:
 ${conversation.map((m) => `${m.role}: ${m.content}`).join("\n")}
 
-Extract and return a JSON array of short fact strings. Include:
-- Their name (if mentioned)
-- Exam they are preparing for
-- Weak topics or subjects
-- Strong topics or subjects
-- Preferred language (Hindi/English/Hinglish)
-- Study goals or targets
-- Any personal context (job, background, etc.)
+Extract a JSON array of short fact strings: name, interests, weak topics, strong topics, language preference, study goals.
 
 Rules:
-- Merge with existing memory, don't duplicate facts
-- Update outdated facts
-- Max 10 facts total, each fact max 15 words
-- Return ONLY a valid JSON array of strings, nothing else
-- Example: ["Preparing for UPSC 2026", "Weak in Economy", "Prefers Hindi"]
+- Merge with existing, don't duplicate
+- Max 10 facts, each max 15 words
+- Return ONLY a JSON array of strings
 `;
     const raw = await callGroqForMemory(extractPrompt);
     if (!raw) return;
@@ -752,7 +733,6 @@ Rules:
         {
           $set: {
             facts,
-            exam,
             updatedAt: new Date(),
             isAnon: userId.startsWith("anon_"),
           },
@@ -789,30 +769,9 @@ const mergeGuestMemory = async (anonId, realUserId) => {
   }
 };
 
-const callGroqForMemory = async (prompt) => {
-  const response = await fetch(
-    "https://api.groq.com/openai/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.1,
-        max_tokens: 500,
-      }),
-    }
-  );
-  const data = await response.json();
-  return data.choices?.[0]?.message?.content?.trim();
-};
-
 const askAIAgentGroq = async (question) => {
   try {
-    const prompt = `You are a routing agent for an exam prep app.\nDecide the best source to answer this question: "${question}"\nReply with ONLY one word: "web_search" or "direct"`;
+    const prompt = `You are a routing agent.\nDecide the best source: "${question}"\nReply with ONLY one word: "web_search" or "direct"`;
     const response = await fetch(
       "https://api.groq.com/openai/v1/chat/completions",
       {
@@ -842,15 +801,10 @@ const askAIAgentGroq = async (question) => {
 
 app.get("/mobile/config", (req, res) => {
   res.json({
-    minVersion: 1,
-    currentVersion: 1,
+    minVersion: 20,
+    currentVersion: 20,
     maintenanceMode: false,
-    features: {
-      aiChat: true,
-      voiceMode: true,
-      jobAlerts: true,
-      resumeBuilder: true,
-    },
+    features: { aiChat: true, voiceMode: true },
   });
 });
 
@@ -871,18 +825,7 @@ const calculateCoins = (score, total, timeTaken, streak) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PRIVACY HELPERS — Strip PII (email/phone) from public-facing userName
-// ═══════════════════════════════════════════════════════════════════════════
-//
-// The released Android app reads `userName` from /leaderboard and /user
-// responses and shows it to OTHER users. Some users signed up with phone or
-// email auth without ever setting a display name, so their userName field
-// got stored as their phone or email — leaking PII to other users.
-//
-// This helper detects emails, phone numbers, empty values, and placeholder
-// strings, replacing them with a stable anonymous handle like "Student3F8A2B"
-// derived from the userId. The response shape stays IDENTICAL, only the
-// VALUE of userName changes, so released-app users will not crash.
+// PRIVACY HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -919,7 +862,7 @@ const getSafeUserName = (user) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CURRENT AFFAIRS
+// CURRENT AFFAIRS — RSS ingestion with full-body extraction
 // ═══════════════════════════════════════════════════════════════════════════
 
 const fetchAndStoreRawNews = async () => {
@@ -942,34 +885,18 @@ const fetchAndStoreRawNews = async () => {
   const seen = new Set();
 
   const sources = [
-    // PIB English — both press releases and features (reg=3 unlocks English)
-    "https://pib.gov.in/RssMain.aspx?ModId=6&Lang=1&Regid=3&reg=3",
-    "https://pib.gov.in/RssMain.aspx?ModId=18&Lang=1&Regid=3&reg=3",
-    // The Hindu — multiple sections
-    "https://www.thehindu.com/news/national/feeder/default.rss",
-    "https://www.thehindu.com/business/feeder/default.rss",
-    "https://www.thehindu.com/sci-tech/feeder/default.rss",
-    "https://www.thehindu.com/sport/feeder/default.rss",
-    "https://www.thehindu.com/opinion/editorial/feeder/default.rss",
-    // Indian Express
-    "https://indianexpress.com/section/india/feed/",
-    "https://indianexpress.com/section/explained/feed/",
-    "https://indianexpress.com/section/business/feed/",
-    // Times of India
-    "https://timesofindia.indiatimes.com/rssfeeds/296589292.cms",
-    "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms",
-    // Hindustan Times
-    "https://www.hindustantimes.com/feeds/rss/india-news/rssfeed.xml",
-    // Policy / Parliament (replacement for old dead URLs)
-    "https://prsindia.org/feed",
-    // Environment — UPSC GS-3 gold
-    "https://www.downtoearth.org.in/rss/news",
-    // Economy
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://ir.thomsonreuters.com/rss/news-releases.xml?items=15",
+    "https://feeds.skynews.com/feeds/rss/world.xml",
+    "https://www.theguardian.com/world/rss",
+    "https://www.moneycontrol.com/rss/latestnews.xml",
     "https://www.livemint.com/rss/news",
   ];
 
   for (const url of sources) {
-    if (allItems.length >= 100) break;
+    if (allItems.length >= 200) break;
     try {
       const feed = await parseRSSWithFallback(url);
       if (!feed) {
@@ -978,8 +905,8 @@ const fetchAndStoreRawNews = async () => {
       }
       let count = 0;
       for (const item of feed.items || []) {
-        if (count >= 15) break;
-        if (allItems.length >= 100) break;
+        if (count >= 40) break;
+        if (allItems.length >= 200) break;
         if (!item.title || seen.has(item.title)) continue;
         const pubDate = item.pubDate ? new Date(item.pubDate) : null;
         const isToday =
@@ -988,21 +915,38 @@ const fetchAndStoreRawNews = async () => {
           pubDate && Date.now() - pubDate.getTime() < 48 * 60 * 60 * 1000;
         if (!pubDate || isToday || isRecent) {
           seen.add(item.title);
-          const rawSnippet =
+
+          const rawBody =
+            item.contentEncoded ||
+            item["content:encoded"] ||
             item.content ||
             item.contentSnippet ||
             item.summary ||
-            item["content:encoded"] ||
             "";
-          const cleanSnippet = rawSnippet
-            .replace(/<[^>]*>/g, "")
+
+          const cleanBody = rawBody
+            .replace(/<script[\s\S]*?<\/script>/gi, "")
+            .replace(/<style[\s\S]*?<\/style>/gi, "")
+            .replace(/<[^>]*>/g, " ")
+            .replace(/&nbsp;/g, " ")
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'")
             .replace(/[\r\n\t]+/g, " ")
             .replace(/\s{2,}/g, " ")
-            .trim()
-            .slice(0, 300);
+            .trim();
+
+          const snippet = cleanBody.slice(0, 300);
+          const fullBody =
+            cleanBody.length > 300 ? cleanBody.slice(0, 3000) : "";
+
           allItems.push({
             title: item.title.replace(/[\r\n\t]+/g, " ").trim(),
-            snippet: cleanSnippet,
+            snippet,
+            fullBody,
+            link: item.link || null,
             source: new URL(url).hostname,
             pubDate: pubDate?.toISOString() || null,
           });
@@ -1015,38 +959,38 @@ const fetchAndStoreRawNews = async () => {
     }
   }
 
-  if (allItems.length < 5) {
-    console.warn("[RAW] ⚠️ Too few RSS items — trying Serper as fallback");
-    if (process.env.SERPER_API_KEY) {
-      try {
-        const r = await fetch("https://google.serper.dev/news", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-KEY": process.env.SERPER_API_KEY,
-          },
-          body: JSON.stringify({
-            q: "India news today",
-            num: 20,
-            gl: "in",
-            hl: "en",
-            tbs: "qdr:d",
-          }),
-        });
-        const d = await r.json();
-        (d.news || []).forEach((n) => {
-          if (allItems.length >= 100) return;
-          if (!seen.has(n.title)) {
-            seen.add(n.title);
-            allItems.push({
-              title: n.title,
-              snippet: (n.snippet || "").slice(0, 300),
-              source: n.source,
-            });
-          }
-        });
-      } catch {}
-    }
+  if (allItems.length < 5 && process.env.SERPER_API_KEY) {
+    console.warn("[RAW] ⚠️ Too few RSS items — trying Serper fallback");
+    try {
+      const r = await fetch("https://google.serper.dev/news", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-KEY": process.env.SERPER_API_KEY,
+        },
+        body: JSON.stringify({
+          q: "India news today",
+          num: 20,
+          gl: "in",
+          hl: "en",
+          tbs: "qdr:d",
+        }),
+      });
+      const d = await r.json();
+      (d.news || []).forEach((n) => {
+        if (allItems.length >= 100) return;
+        if (!seen.has(n.title)) {
+          seen.add(n.title);
+          allItems.push({
+            title: n.title,
+            snippet: (n.snippet || "").slice(0, 300),
+            fullBody: "",
+            link: n.link || null,
+            source: n.source,
+          });
+        }
+      });
+    } catch {}
   }
 
   const capped = allItems.slice(0, 100);
@@ -1057,15 +1001,284 @@ const fetchAndStoreRawNews = async () => {
       { $set: { date: today, items: capped, fetchedAt: new Date() } },
       { upsert: true }
     );
-  console.log(`[RAW] ✅ Stored ${capped.length} headlines — 0 API cost`);
+  console.log(`[RAW] ✅ Stored ${capped.length} items — 0 API cost`);
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DAILY CURRENT AFFAIRS QUIZ — single hard quiz
+// ═══════════════════════════════════════════════════════════════════════════
+
+const generateCurrentAffairsQuiz = async (newsItems) => {
+  const ranked = [...newsItems]
+    .filter((i) => i.fullBody || (i.snippet && i.snippet.length > 50))
+    .sort((a, b) => {
+      const scoreA = (a.fullBody?.length || 0) + (a.snippet?.length || 0);
+      const scoreB = (b.fullBody?.length || 0) + (b.snippet?.length || 0);
+      return scoreB - scoreA;
+    })
+    .slice(0, 20);
+
+  if (ranked.length < 5) return null;
+
+  const contextBlock = ranked
+    .map((item, i) => {
+      const body = item.fullBody?.slice(0, 800) || item.snippet || "";
+      return `[${i + 1}] ${item.title}\nSource: ${item.source}\n${body}\n`;
+    })
+    .join("\n---\n");
+
+  const prompt = `You are a senior question setter for competitive exams.
+
+Generate exactly 10 HARD MCQs from these current affairs items.
+
+DIFFICULTY: HARD — competitive exam level (UPSC Prelims style).
+
+STYLE:
+- Use "Consider the following statements" format for at least 4 questions
+- Use "Which of the following is/are correct?" for at least 2 questions
+- Distractors must be highly plausible
+- Test conceptual understanding, not just headlines
+- Include subtle traps: dates, ministry names, sequence of events, exact figures
+- Avoid trivial recall
+
+NEWS ITEMS:
+${contextBlock}
+
+Rules:
+- Each MCQ answerable from the items above — don't invent facts
+- 4 options each, exactly one correct
+- 1-2 sentence explanation
+- Cover diverse topics
+
+Return ONLY a valid JSON array:
+[
+  {
+    "question": "Consider the following statements:\\n1. Statement A\\n2. Statement B\\n3. Statement C\\nWhich of the statements above is/are correct?",
+    "options": ["1 and 2 only", "2 and 3 only", "1 and 3 only", "1, 2 and 3"],
+    "correct": 0,
+    "explanation": "...",
+    "topic": "Polity | Economy | Governance | IR | Environment | Schemes | Science | Defence | Social | International"
+  }
+]
+
+correct = index (0-3) of right option.`;
+
+  try {
+    const raw = await callGeminiOnce(prompt, 4000);
+    if (!raw) return null;
+    const cleaned = raw.replace(/```json|```/g, "").trim();
+    const questions = extractJSONArray(cleaned);
+    if (!Array.isArray(questions) || questions.length < 5) return null;
+
+    const validated = questions
+      .filter(
+        (q) =>
+          q.question &&
+          Array.isArray(q.options) &&
+          q.options.length === 4 &&
+          typeof q.correct === "number" &&
+          q.correct >= 0 &&
+          q.correct <= 3
+      )
+      .map((q) => ({
+        question: q.question.trim(),
+        options: q.options.map((o) => String(o).trim()),
+        correct: q.correct,
+        explanation: (q.explanation || "").trim(),
+        topic: q.topic || "General",
+      }));
+
+    return validated.length >= 5 ? validated : null;
+  } catch (err) {
+    console.warn(`[CA Quiz] Generation failed:`, err.message);
+    return null;
+  }
+};
+
+const generateDailyQuiz = async () => {
+  const today = new Date().toISOString().split("T")[0];
+  const existing = await db
+    .collection("current_affairs_quizzes")
+    .findOne({ date: today });
+  if (existing) return;
+
+  const rawDoc = await db.collection("raw_news").findOne({ date: today });
+  if (!rawDoc?.items?.length) return;
+
+  console.log("[CA Quiz] Generating today's quiz...");
+  const questions = await generateCurrentAffairsQuiz(rawDoc.items);
+  if (!questions) return;
+
+  await db.collection("current_affairs_quizzes").updateOne(
+    { date: today },
+    {
+      $set: {
+        date: today,
+        questions,
+        generatedAt: new Date(),
+        totalQuestions: questions.length,
+      },
+    },
+    { upsert: true }
+  );
+  console.log(`[CA Quiz] ✅ ${questions.length} hard questions stored`);
 };
 
 const runDailyPregeneration = async () => {
-  console.log("[CRON] 🌅 Daily news refresh —", new Date().toISOString());
-  await db.collection("raw_news").deleteMany({});
-  console.log("[CRON] 🗑️ Old news deleted");
+  console.log("[CRON] 🌅 Daily refresh —", new Date().toISOString());
+  const today = new Date().toISOString().split("T")[0];
+  await db.collection("raw_news").deleteMany({ date: { $ne: today } });
+  await db
+    .collection("current_affairs_quizzes")
+    .deleteMany({ date: { $ne: today } });
   await fetchAndStoreRawNews();
-  console.log("[CRON] ✅ Fresh news ready");
+  await generateDailyQuiz();
+  console.log("[CRON] ✅ Done");
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUSH NOTIFICATION HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+const IST_TZ_OFFSET_MINUTES = 5 * 60 + 30;
+
+const getISTHour = () => {
+  const now = new Date();
+  const istMs = now.getTime() + IST_TZ_OFFSET_MINUTES * 60 * 1000;
+  return new Date(istMs).getUTCHours();
+};
+
+const isQuietHours = () => {
+  const hour = getISTHour();
+  return hour >= 23 || hour < 6;
+};
+
+const PUSH_DELAY_MS = 30;
+
+const sendPushToAllUsers = async ({ title, body, type }) => {
+  if (isQuietHours()) {
+    console.log(`[Push:${type}] Skipped — quiet hours`);
+    return { sent: 0, failed: 0, skipped: 0 };
+  }
+  try {
+    const query = {
+      fcmToken: { $exists: true, $ne: null },
+      $or: [
+        { "notificationPrefs.enabled": { $exists: false } },
+        { "notificationPrefs.enabled": true },
+      ],
+    };
+
+    const users = await getUsers()
+      .find(query)
+      .project({ userId: 1, fcmToken: 1, notificationPrefs: 1 })
+      .toArray();
+
+    let sent = 0,
+      failed = 0,
+      skipped = 0;
+    const invalidTokens = [];
+
+    for (const user of users) {
+      if (user.notificationPrefs?.[type] === false) {
+        skipped++;
+        continue;
+      }
+      try {
+        await admin.messaging().send({
+          token: user.fcmToken,
+          notification: { title, body },
+          data: { type, timestamp: String(Date.now()) },
+          android: {
+            priority: "high",
+            notification: {
+              channelId:
+                type === "quiz_nudge"
+                  ? "quiz_alerts"
+                  : type === "current_affairs_morning" ||
+                    type === "current_affairs_evening"
+                  ? "current_affairs"
+                  : "general",
+            },
+          },
+        });
+        sent++;
+      } catch (err) {
+        failed++;
+        const code = err?.errorInfo?.code || err?.code || "";
+        if (
+          code.includes("registration-token-not-registered") ||
+          code.includes("invalid-argument") ||
+          code.includes("invalid-registration-token")
+        ) {
+          invalidTokens.push(user.userId);
+        }
+      }
+      await new Promise((r) => setTimeout(r, PUSH_DELAY_MS));
+    }
+
+    if (invalidTokens.length) {
+      getUsers()
+        .updateMany(
+          { userId: { $in: invalidTokens } },
+          { $unset: { fcmToken: "" } }
+        )
+        .catch(() => {});
+    }
+
+    console.log(
+      `[Push:${type}] sent=${sent} failed=${failed} skipped=${skipped}`
+    );
+    return { sent, failed, skipped };
+  } catch (err) {
+    console.error(`[Push:${type}] Fatal:`, err.message);
+    return { sent: 0, failed: 0, skipped: 0 };
+  }
+};
+
+const getMorningPushContent = async () => {
+  const today = new Date().toISOString().split("T")[0];
+  const rawDoc = await db.collection("raw_news").findOne({ date: today });
+  if (!rawDoc?.items?.length) return null;
+  return {
+    title: `📰 Today's brief is ready`,
+    body: `${rawDoc.items.length} current affairs waiting — start your prep`,
+  };
+};
+
+const getEveningPushContent = async () => {
+  const today = new Date().toISOString().split("T")[0];
+  const rawDoc = await db.collection("raw_news").findOne({ date: today });
+  if (!rawDoc?.items?.length) return null;
+  return {
+    title: `🌆 Evening update`,
+    body: `Fresh stories since morning — open the digest`,
+  };
+};
+
+const getQuizPushContent = async () => {
+  const today = new Date().toISOString().split("T")[0];
+  const quiz = await db
+    .collection("current_affairs_quizzes")
+    .findOne({ date: today });
+  if (!quiz) {
+    return { title: "🎯 Quiz time", body: "Test what you learned today" };
+  }
+  const variants = [
+    {
+      title: "🎯 Today's CA Quiz — 10 Qs",
+      body: "Test your knowledge. 5 min, earn coins.",
+    },
+    {
+      title: "🧠 Did you absorb today's CA?",
+      body: "Find out in 10 questions",
+    },
+    {
+      title: "🏆 Maintain your streak",
+      body: "Today's current affairs quiz is live",
+    },
+  ];
+  return variants[new Date().getDate() % variants.length];
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1079,7 +1292,38 @@ app.get("/admin/refresh-news", async (req, res) => {
   const today = new Date().toISOString().split("T")[0];
   await db.collection("raw_news").deleteMany({ date: today });
   await fetchAndStoreRawNews();
-  res.json({ success: true, message: "News refreshed" });
+  res.json({ success: true });
+});
+
+app.get("/admin/regenerate-ca-quiz", async (req, res) => {
+  const today = new Date().toISOString().split("T")[0];
+  await db.collection("current_affairs_quizzes").deleteMany({ date: today });
+  await generateDailyQuiz();
+  res.json({ success: true });
+});
+
+app.get("/admin/test-push/:type", async (req, res) => {
+  const { type } = req.params;
+  let content;
+  if (type === "morning") content = await getMorningPushContent();
+  else if (type === "evening") content = await getEveningPushContent();
+  else if (type === "quiz") content = await getQuizPushContent();
+  else return res.status(400).json({ error: "Invalid type" });
+  if (!content) return res.json({ error: "No content available" });
+
+  const pushType =
+    type === "quiz"
+      ? "quiz_nudge"
+      : type === "morning"
+      ? "current_affairs_morning"
+      : "current_affairs_evening";
+
+  const result = await sendPushToAllUsers({
+    title: content.title,
+    body: content.body,
+    type: pushType,
+  });
+  res.json({ content, result });
 });
 
 // ── Chat history ──────────────────────────────────────────────────────────────
@@ -1088,7 +1332,7 @@ app.get("/chats/:userId", async (req, res) => {
     const chats = await getChats()
       .find({ userId: req.params.userId })
       .sort({ updatedAt: -1 })
-      .project({ title: 1, updatedAt: 1, exam: 1 })
+      .project({ title: 1, updatedAt: 1 })
       .toArray();
     res.json(chats);
   } catch {
@@ -1123,11 +1367,9 @@ app.delete("/chats/:userId/:chatId", async (req, res) => {
 
 app.post("/chats/:userId", async (req, res) => {
   try {
-    const { exam = "General" } = req.body;
     const newChat = {
       userId: req.params.userId,
       title: "New Chat",
-      exam,
       messages: [],
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -1141,7 +1383,7 @@ app.post("/chats/:userId", async (req, res) => {
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
 app.post("/chat", async (req, res) => {
-  const { question, exam, history = [], userId, chatId, anonId } = req.body;
+  const { question, history = [], userId, chatId, anonId } = req.body;
   if (!question) return res.status(400).json({ error: "Question is required" });
   try {
     const resolvedUserId = userId || anonId || null;
@@ -1153,18 +1395,12 @@ app.post("/chat", async (req, res) => {
       /^(hi|hello|hey|thanks|thank you|ok|okay|help|start)$/i.test(
         question.trim()
       );
-    if (!isSimple) decision = await askAIAgentGroq(question, exam);
+    if (!isSimple) decision = await askAIAgentGroq(question);
     if (decision.action === "web_search") {
       const ctx = await fetchLiveSearchContext(decision.query);
       if (ctx) finalPrompt = `${ctx}\n\nQuestion: ${question}`;
-    } else if (decision.action === "world_bank") {
-      const wb = await fetchWorldBankData(
-        decision.country_code,
-        decision.indicator
-      );
-      if (wb) finalPrompt = `${wb}\n\nQuestion: ${question}`;
     }
-    const answer = await askAI(finalPrompt, exam, history, false, memory);
+    const answer = await askAI(finalPrompt, history, false, memory);
     if (chatId && (userId || anonId)) {
       await getChats().updateOne(
         { _id: new ObjectId(chatId), userId: userId || anonId },
@@ -1187,7 +1423,7 @@ app.post("/chat", async (req, res) => {
         { role: "user", content: question },
         { role: "assistant", content: answer },
       ];
-      saveMemory(resolvedUserId, updatedHistory, exam).catch((err) =>
+      saveMemory(resolvedUserId, updatedHistory).catch((err) =>
         console.warn("⚠️ Memory save failed:", err.message)
       );
     }
@@ -1200,19 +1436,16 @@ app.post("/chat", async (req, res) => {
 
 // ── User profile ──────────────────────────────────────────────────────────────
 app.post("/user/sync", async (req, res) => {
-  const { userId, userName, exam, xp = 0 } = req.body;
+  const { userId, userName, xp = 0 } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   try {
-    // Privacy: if incoming userName is a phone/email/empty, replace it before
-    // storing — prevents new pollution. Real userName the user typed is kept.
     const safeName = isPiiUserName(userName)
       ? buildAnonHandle(userId)
       : userName.trim();
-
     await getUsers().updateOne(
       { userId },
       {
-        $set: { userName: safeName, exam, updatedAt: new Date() },
+        $set: { userName: safeName, updatedAt: new Date() },
         $inc: { xp },
         $setOnInsert: {
           coins: 0,
@@ -1233,17 +1466,8 @@ app.get("/user/:userId", async (req, res) => {
   try {
     const user = await getUsers().findOne({ userId: req.params.userId });
     if (!user) return res.status(404).json({ error: "User not found" });
-
-    // Privacy: strip PII fields before returning. The released app reads
-    // userName / coins / streak / xp / exam / lastPlayedDate / createdAt /
-    // updatedAt — all preserved. We drop sensitive/internal fields entirely.
     const { email, phone, phoneNumber, fcmToken, _id, ...rest } = user;
-    const safeUser = {
-      ...rest,
-      userName: getSafeUserName(user),
-    };
-
-    res.json(safeUser);
+    res.json({ ...rest, userName: getSafeUserName(user) });
   } catch {
     res.status(500).json({ error: "Failed to load user" });
   }
@@ -1272,57 +1496,103 @@ app.post("/user/merge-memory", async (req, res) => {
   try {
     await mergeGuestMemory(anonId, userId);
     res.json({ success: true });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "Memory merge failed" });
   }
 });
 
-// ── Quiz ──────────────────────────────────────────────────────────────────────
+app.patch("/user/:userId/notification-prefs", async (req, res) => {
+  const { userId } = req.params;
+  const {
+    enabled,
+    current_affairs_morning,
+    current_affairs_evening,
+    quiz_nudge,
+  } = req.body;
+  try {
+    const update = {};
+    if (typeof enabled === "boolean")
+      update["notificationPrefs.enabled"] = enabled;
+    if (typeof current_affairs_morning === "boolean")
+      update["notificationPrefs.current_affairs_morning"] =
+        current_affairs_morning;
+    if (typeof current_affairs_evening === "boolean")
+      update["notificationPrefs.current_affairs_evening"] =
+        current_affairs_evening;
+    if (typeof quiz_nudge === "boolean")
+      update["notificationPrefs.quiz_nudge"] = quiz_nudge;
+    await getUsers().updateOne(
+      { userId },
+      { $set: { ...update, updatedAt: new Date() } }
+    );
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: "Failed to update prefs" });
+  }
+});
+
+app.get("/user/:userId/notification-prefs", async (req, res) => {
+  try {
+    const user = await getUsers().findOne(
+      { userId: req.params.userId },
+      { projection: { notificationPrefs: 1, _id: 0 } }
+    );
+    res.json({
+      enabled: user?.notificationPrefs?.enabled !== false,
+      current_affairs_morning:
+        user?.notificationPrefs?.current_affairs_morning !== false,
+      current_affairs_evening:
+        user?.notificationPrefs?.current_affairs_evening !== false,
+      quiz_nudge: user?.notificationPrefs?.quiz_nudge !== false,
+    });
+  } catch {
+    res.status(500).json({ error: "Failed to load prefs" });
+  }
+});
+
+// ── Quiz generation (with difficulty) ─────────────────────────────────────────
 app.post("/quiz/generate", async (req, res) => {
-  const { topic, exam = "General", count = 10, userId, state } = req.body;
+  const { topic, count = 10, userId, difficulty = "hard" } = req.body;
   if (!checkUserRateLimit(userId))
     return res.status(429).json({ error: "Limit reached" });
   if (!topic) return res.status(400).json({ error: "Topic required" });
-  const safeCount = Math.min(Number(count) || 10, 20);
-  const finalTopic =
-    exam === "State PCS" && state ? `${state} — ${topic}` : topic;
+  const safeCount = Math.min(Math.max(Number(count) || 10, 1), 40);
+  const safeDifficulty = ["easy", "medium", "hard"].includes(difficulty)
+    ? difficulty
+    : "hard";
+
   if (userId) {
     const solvedResults = await getQuizResults()
-      .find({ userId, exam, topic: finalTopic, quizId: { $ne: null } })
+      .find({ userId, topic, quizId: { $ne: null } })
       .project({ quizId: 1 })
       .toArray();
     const solvedIds = solvedResults.map((r) => r.quizId).filter(Boolean);
     const existingQuiz = await getQuizzes().findOne({
-      topic: finalTopic,
-      exam,
+      topic,
+      difficulty: safeDifficulty,
       ...(solvedIds.length ? { _id: { $nin: solvedIds } } : {}),
       createdAt: { $exists: true },
+      "questions.10": { $exists: safeCount > 10 ? true : false },
     });
     if (existingQuiz) {
-      console.log(`♻️ Serving pooled quiz ${existingQuiz._id} to ${userId}`);
+      console.log(`♻️ Serving pooled quiz ${existingQuiz._id}`);
       return res.json({
         quizId: existingQuiz._id,
         questions: existingQuiz.questions,
-        contextUsed: false,
         reused: true,
       });
     }
   }
-  const contextBlock =
-    exam === "Current Affairs"
-      ? await fetchLiveSearchContext(
-          `${finalTopic} India government PIB official`
-        )
-      : "";
-  const prompt = getQuizPrompt(exam, finalTopic, safeCount, contextBlock);
+
+  const prompt = getQuizPrompt("General", topic, safeCount, "", safeDifficulty);
   try {
-    const content = await generateAIContent(prompt, !!contextBlock);
+    const content = await generateAIContent(prompt, false);
     const questions = extractJSONArray(
       content.replace(/```json|```/gi, "").trim()
     );
     const quizDoc = {
-      topic: finalTopic,
-      exam,
+      topic,
+      difficulty: safeDifficulty,
       questions,
       createdAt: new Date(),
     };
@@ -1330,7 +1600,6 @@ app.post("/quiz/generate", async (req, res) => {
     res.json({
       quizId: result.insertedId,
       questions,
-      contextUsed: !!contextBlock,
       reused: false,
     });
   } catch (err) {
@@ -1339,9 +1608,57 @@ app.post("/quiz/generate", async (req, res) => {
   }
 });
 
+// ── Daily Current Affairs Quiz ────────────────────────────────────────────────
+app.get("/current-affairs-quiz", async (req, res) => {
+  const userId = req.query.userId;
+  const today = new Date().toISOString().split("T")[0];
+  try {
+    const quizDoc = await db
+      .collection("current_affairs_quizzes")
+      .findOne({ date: today });
+    if (!quizDoc) {
+      return res.json({
+        date: today,
+        questions: [],
+        available: false,
+        message: "Today's quiz is being prepared.",
+      });
+    }
+    let alreadyAttempted = false;
+    let previousScore = null;
+    if (userId) {
+      const result = await getQuizResults().findOne({
+        userId,
+        topic: `Current Affairs ${today}`,
+      });
+      if (result) {
+        alreadyAttempted = true;
+        previousScore = {
+          score: result.score,
+          total: result.total,
+          percentage: result.percentage,
+          coinsEarned: result.coinsEarned,
+        };
+      }
+    }
+    res.json({
+      date: today,
+      quizId: quizDoc._id,
+      questions: quizDoc.questions,
+      totalQuestions: quizDoc.totalQuestions,
+      available: true,
+      alreadyAttempted,
+      previousScore,
+    });
+  } catch (err) {
+    console.error("[CA Quiz] Fetch error:", err.message);
+    res.status(500).json({ error: "Failed to fetch quiz" });
+  }
+});
+
 // ── Quiz Result ───────────────────────────────────────────────────────────────
 app.post("/quiz/result", async (req, res) => {
-  const { userId, topic, exam, score, total, timeTaken, quizId } = req.body;
+  const { userId, topic, score, total, timeTaken, quizId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   try {
     const user = await getUsers().findOne({ userId });
@@ -1350,16 +1667,13 @@ app.post("/quiz/result", async (req, res) => {
     const yesterday = new Date(Date.now() - 86400000)
       .toISOString()
       .split("T")[0];
-
     const newStreak =
       lastPlayed === today
         ? user?.streak || 1
         : lastPlayed === yesterday
         ? (user?.streak || 0) + 1
         : 1;
-
     const coinsEarned = calculateCoins(score, total, timeTaken, newStreak);
-
     await getUsers().updateOne(
       { userId },
       {
@@ -1373,11 +1687,9 @@ app.post("/quiz/result", async (req, res) => {
       },
       { upsert: true }
     );
-
     await getQuizResults().insertOne({
       userId,
       topic,
-      exam,
       score,
       total,
       percentage: Math.round((score / total) * 100),
@@ -1386,7 +1698,6 @@ app.post("/quiz/result", async (req, res) => {
       quizId: quizId ? new ObjectId(quizId) : null,
       createdAt: new Date(),
     });
-
     const updatedUser = await getUsers().findOne({ userId });
     res.json({
       success: true,
@@ -1414,33 +1725,21 @@ app.get("/quiz/history/:userId", async (req, res) => {
 });
 
 // ── Leaderboard ───────────────────────────────────────────────────────────────
-//
-// Response shape (UNCHANGED — released app depends on it):
-//   { leaderboard: [{ userId, userName, coins, streak }], userRank }
-//
-// Privacy fix: `userName` is sanitized via getSafeUserName() so any user that
-// has email/phone/empty stored as userName will show as "StudentXXXXXX"
-// instead of leaking their personal info to other users.
-// ═══════════════════════════════════════════════════════════════════════════
-app.get("/leaderboard/:exam", async (req, res) => {
-  const { exam } = req.params;
+app.get("/leaderboard", async (req, res) => {
   const userId = req.query.userId;
   try {
     const topUsers = await getUsers()
-      .find({ exam, coins: { $gt: 0 } })
+      .find({ coins: { $gt: 0 } })
       .sort({ coins: -1 })
       .limit(20)
       .project({ userId: 1, userName: 1, coins: 1, streak: 1, _id: 0 })
       .toArray();
-
-    // Sanitize userName before exposing — same shape, just PII stripped
     const sanitizedLeaderboard = topUsers.map((user) => ({
       userId: user.userId,
       userName: getSafeUserName(user),
       coins: user.coins || 0,
       streak: user.streak || 0,
     }));
-
     let userRank = null;
     if (userId) {
       const userDoc = await getUsers().findOne(
@@ -1449,12 +1748,10 @@ app.get("/leaderboard/:exam", async (req, res) => {
       );
       const userCoins = userDoc?.coins || 0;
       const higherCount = await getUsers().countDocuments({
-        exam,
         coins: { $gt: userCoins },
       });
       userRank = higherCount + 1;
     }
-
     res.json({ leaderboard: sanitizedLeaderboard, userRank });
   } catch (err) {
     console.error("❌ Leaderboard error:", err.message);
@@ -1463,49 +1760,29 @@ app.get("/leaderboard/:exam", async (req, res) => {
 });
 
 // ── Current Affairs ───────────────────────────────────────────────────────────
-app.get("/current-affairs/:exam", async (req, res) => {
-  const { exam } = req.params;
-  const lang = req.query.lang === "hinglish" ? "hinglish" : "english";
+app.get("/current-affairs", async (req, res) => {
   const today = new Date().toISOString().split("T")[0];
-
   try {
     let rawDoc = await db.collection("raw_news").findOne({ date: today });
-
     if (!rawDoc?.items?.length) {
-      console.log("[CA] No news in DB — fetching now...");
       await fetchAndStoreRawNews();
       rawDoc = await db.collection("raw_news").findOne({ date: today });
     }
-
     if (!rawDoc?.items?.length) {
-      return res.json({
-        date: today,
-        exam,
-        lang,
-        affairs: [],
-        cached: false,
-        total: 0,
-      });
+      return res.json({ date: today, affairs: [], total: 0 });
     }
-
     const affairs = rawDoc.items.map((item, i) => ({
       id: `ca_${i + 1}`,
-      category: "National",
       headline: item.title,
       summary: item.snippet && item.snippet !== item.title ? item.snippet : "",
-      importance: "high",
-      examRelevance: "",
-      tags: [exam],
+      fullBody: item.fullBody || null,
+      link: item.link || null,
       source: item.source,
       pubDate: item.pubDate,
     }));
-
     res.json({
       date: rawDoc.date,
-      exam,
-      lang,
       affairs,
-      cached: true,
       total: affairs.length,
     });
   } catch (err) {
@@ -1530,7 +1807,6 @@ app.post("/image/generate", async (req, res) => {
       modelUsed: result.modelUsed,
       routeType: result.aspect,
       promptUsed: richPrompt,
-      attemptCount: 1,
     });
   } catch (err) {
     console.error("❌ /image/generate:", err.message);
@@ -1559,9 +1835,6 @@ app.post("/image/edit", upload.single("image"), async (req, res) => {
     return res.json({
       imageUrl: result.imageUrl,
       modelUsed: result.modelUsed,
-      routeType: result.aspect,
-      promptUsed: result.promptUsed,
-      attemptCount: 1,
       mode: result.mode,
     });
   } catch (err) {
@@ -1570,32 +1843,51 @@ app.post("/image/edit", upload.single("image"), async (req, res) => {
   }
 });
 
+// ── Image / PDF upload — vision analysis or PDF text extraction ──────────────
 app.post("/image", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "File required" });
+
+    const userId = req.body.userId || req.body.anonId || null;
+    const userPrompt =
+      typeof req.body.prompt === "string" ? req.body.prompt.trim() : "";
+    const memory = userId ? await loadMemory(userId) : [];
+
+    // PDF flow — extract text first, then ask AI tutor
     if (req.file.mimetype === "application/pdf") {
       try {
         const { text } = await extractText(req.file.buffer);
-        req.file.buffer = null;
         if (text && text.trim().length > 50) {
-          const answer = await askAI(text, req.body.exam);
+          const combined = userPrompt
+            ? `${userPrompt}\n\n[Uploaded document content]\n${text.slice(
+                0,
+                12000
+              )}`
+            : `Analyze and explain this uploaded document. Extract key concepts, formulas, and likely exam questions.\n\n[Document content]\n${text.slice(
+                0,
+                12000
+              )}`;
+          const answer = await askAI(combined, [], false, memory);
+          req.file.buffer = null;
           return res.json({ answer });
         }
-      } catch {
-        console.log(
-          "⚠️ Local PDF extraction failed, switching to Vision AI..."
-        );
+      } catch (err) {
+        console.warn("⚠️ PDF text extraction failed:", err.message);
+        // fall through to vision
       }
     }
+
+    // Image flow — pass user prompt to vision model
     const answer = await askAIWithImage(
       req.file.buffer,
       req.file.mimetype,
-      req.body.exam
+      userPrompt
     );
     req.file.buffer = null;
     res.json({ answer });
-  } catch {
-    res.status(500).json({ error: "Image failed" });
+  } catch (err) {
+    console.error("❌ /image error:", err.message);
+    res.status(500).json({ error: "Image processing failed" });
   }
 });
 
@@ -1630,44 +1922,34 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     res.status(500).json({ error: "Transcription failed" });
   }
 });
-
-// ── Chart generation ──────────────────────────────────────────────────────────
-app.post("/chart/generate", async (req, res) => {
-  const { question, exam = "General" } = req.body;
-  if (!question) return res.status(400).json({ error: "Question required" });
-  const prompt = `You are a data visualization expert for Indian competitive exams.\nGenerate a chart for this topic: "${question}" for a ${exam} student.\nReturn ONLY a valid JSON object:\n{ "type": "bar"|"line"|"pie"|"doughnut", "title": "...", "labels": [...], "datasets": [{ "label": "...", "data": [...] }], "insight": "..." }\nUse real accurate data. Max 8 data points. Return ONLY the JSON.`;
+// ── Bonus coins (rewarded ad rewards, daily login, etc.) ─────────────────────
+app.post("/user/bonus-coins", async (req, res) => {
+  const { userId, amount, reason } = req.body;
+  if (!userId || !amount || amount < 0 || amount > 500) {
+    return res.status(400).json({ error: "Invalid request" });
+  }
   try {
-    const response = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
+    await getUsers().updateOne(
+      { userId },
       {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        $inc: { coins: amount },
+        $push: {
+          bonusLog: {
+            $each: [{ amount, reason: reason || "bonus", at: new Date() }],
+            $slice: -50, // keep last 50 bonus events only
+          },
         },
-        body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.1,
-          max_tokens: 1000,
-        }),
-      }
+        $set: { updatedAt: new Date() },
+      },
+      { upsert: false }
     );
-    if (!response.ok) throw new Error(`Groq error: ${response.status}`);
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content;
-    if (!raw) throw new Error("Empty response");
-    const cleaned = raw.replace(/```json|```/g, "").trim();
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-    if (start === -1 || end === -1) throw new Error("No JSON found");
-    res.json(JSON.parse(cleaned.slice(start, end + 1)));
+    const updated = await getUsers().findOne({ userId });
+    res.json({ success: true, totalCoins: updated?.coins || 0 });
   } catch (err) {
-    console.error("❌ Chart error:", err.message);
-    res.status(500).json({ error: "Chart generation failed" });
+    console.error("❌ Bonus coins error:", err.message);
+    res.status(500).json({ error: "Failed to credit coins" });
   }
 });
-
 // ── Data deletion ─────────────────────────────────────────────────────────────
 app.delete("/user/:userId/delete-data", async (req, res) => {
   const { userId } = req.params;
@@ -1676,28 +1958,153 @@ app.delete("/user/:userId/delete-data", async (req, res) => {
       getUsers().deleteOne({ userId }),
       getChats().deleteMany({ userId }),
       getQuizResults().deleteMany({ userId }),
-      getResumes().deleteMany({ userId }),
       getMemories().deleteMany({ userId }),
     ]);
-    res.json({ success: true, message: "All user data deleted successfully." });
+    res.json({ success: true });
   } catch {
     res.status(500).json({ error: "Failed to delete user data" });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// BACKWARD-COMPAT SHIMS for released app (v19 and below)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Old leaderboard — redirect to new endpoint (same shape)
+app.get("/leaderboard/:exam", (req, res, next) => {
+  req.url = `/leaderboard${
+    req.url.includes("?") ? req.url.substring(req.url.indexOf("?")) : ""
+  }`;
+  app._router.handle(req, res, next);
+});
+
+// Old current-affairs — legacy field shape with category/importance/content
+app.get("/current-affairs/:exam", async (req, res) => {
+  const today = new Date().toISOString().split("T")[0];
+  try {
+    let rawDoc = await db.collection("raw_news").findOne({ date: today });
+    if (!rawDoc?.items?.length) {
+      await fetchAndStoreRawNews();
+      rawDoc = await db.collection("raw_news").findOne({ date: today });
+    }
+    const affairs = (rawDoc?.items || [])
+      .filter(
+        (item) =>
+          (item.fullBody && item.fullBody.length > 100) ||
+          (item.snippet && item.snippet.length > 80)
+      )
+      .map((item, i) => ({
+        id: `ca_${i + 1}`,
+        category: "National",
+        headline: item.title,
+        summary:
+          item.snippet && item.snippet !== item.title ? item.snippet : "",
+        content: item.fullBody || item.snippet || item.title,
+        importance: "high",
+        examRelevance: req.params.exam || "General",
+        tags: [],
+      }));
+    res.json({
+      date: rawDoc?.date || today,
+      exam: req.params.exam || "General",
+      lang: req.query.lang || "english",
+      affairs,
+      cached: false,
+    });
+  } catch (err) {
+    console.error("[CA compat] ❌", err.message);
+    res.status(500).json({ error: "Failed to fetch current affairs" });
+  }
+});
+
+// Jobs — return object shape, not array (old Gson model expects object)
+app.get("/jobs", (req, res) => res.json({ jobs: [], total: 0, page: 1 }));
+app.get("/jobs/*", (req, res) => res.json({ jobs: [], total: 0, page: 1 }));
+app.post("/jobs/*", (req, res) => res.json({ success: true }));
+
+// Resume — return [] shape for old app's List<ResumeResponse>
+app.get("/resume/:userId", (req, res) => res.json([]));
+app.get("/resume/:userId/:id", (req, res) =>
+  res.json({ _id: "", title: "Update required", updatedAt: "" })
+);
+app.post("/resume/generate", (req, res) =>
+  res.status(410).json({ error: "Please update the app to continue" })
+);
+app.post("/resume/:userId", (req, res) => res.json({ success: true }));
+app.delete("/resume/:userId", (req, res) => res.json({ success: true }));
+app.delete("/resume/:userId/:id", (req, res) => res.json({ success: true }));
+
+// Chart removed — graceful error
+app.post("/chart/generate", (req, res) =>
+  res.status(410).json({ error: "Feature no longer available. Please update." })
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════════════════════════════
 
 connectDB().then(async () => {
-  await startJobCron(getJobs, getUsers);
-
-  // ── Mount billing module ────────────────────────────────────────────────
   const billing = await initializeBilling({ db });
   app.use("/billing", billing.router);
 
+  // Flashcards module
+  const flashcards = initializeFlashcards({
+    db,
+    callGeminiOnce,
+    extractJSONArray,
+  });
+  app.use("/flashcards", flashcards.router);
+  console.log("✅ Flashcards module mounted at /flashcards");
+
   cron.schedule("30 0 * * *", runDailyPregeneration, { timezone: "UTC" });
-  console.log("✅ Raw news cron scheduled — 6:00 AM IST daily");
+  console.log("✅ Daily news + quiz cron — 6:00 AM IST");
+
+  cron.schedule(
+    "30 1 * * *",
+    async () => {
+      const content = await getMorningPushContent();
+      if (!content) return;
+      await sendPushToAllUsers({
+        title: content.title,
+        body: content.body,
+        type: "current_affairs_morning",
+      });
+    },
+    { timezone: "UTC" }
+  );
+  console.log("✅ Morning push — 7:00 AM IST");
+
+  cron.schedule(
+    "0 13 * * *",
+    async () => {
+      try {
+        await fetchAndStoreRawNews();
+      } catch {}
+      const content = await getEveningPushContent();
+      if (!content) return;
+      await sendPushToAllUsers({
+        title: content.title,
+        body: content.body,
+        type: "current_affairs_evening",
+      });
+    },
+    { timezone: "UTC" }
+  );
+  console.log("✅ Evening push — 6:30 PM IST");
+
+  cron.schedule(
+    "0 16 * * *",
+    async () => {
+      const content = await getQuizPushContent();
+      await sendPushToAllUsers({
+        title: content.title,
+        body: content.body,
+        type: "quiz_nudge",
+      });
+    },
+    { timezone: "UTC" }
+  );
+  console.log("✅ Quiz push — 9:30 PM IST");
 
   setInterval(() => {
     const now = Date.now();
@@ -1707,9 +2114,6 @@ connectDB().then(async () => {
     for (const [key, val] of userQuizCounts.entries()) {
       if (now - val.windowStart > 60 * 60 * 1000) userQuizCounts.delete(key);
     }
-    console.log(
-      `🧹 Cache cleaned — search:${searchCache.size} quiz:${userQuizCounts.size}`
-    );
   }, 60 * 60 * 1000);
 
   setInterval(() => {
@@ -1718,34 +2122,32 @@ connectDB().then(async () => {
     if (mb > 400) {
       searchCache.clear();
       userQuizCounts.clear();
-      console.log("⚠️ High memory — caches force cleared!");
     }
   }, 5 * 60 * 1000);
 
+  // Daily cleanup — empty chats + old flashcard generation logs
   cron.schedule("0 2 * * *", async () => {
     try {
-      const result = await getChats().deleteMany({
+      await getChats().deleteMany({
         messages: { $size: 0 },
         createdAt: { $lt: new Date(Date.now() - 24 * 60 * 60 * 1000) },
       });
-      console.log(`🧹 Deleted ${result.deletedCount} empty chats`);
+      await cleanupOldFlashcardData(db);
     } catch (err) {
-      console.warn("⚠️ Empty chat cleanup failed:", err.message);
+      console.warn("⚠️ Daily cleanup failed:", err.message);
     }
   });
 
-  // ── Error handlers (registered AFTER all routes including /billing) ───
+  // 404 handler MUST be registered LAST
   app.use((req, res) => res.status(404).json({ error: "Route not found" }));
   app.use((err, req, res, next) => {
     if (err.code === "LIMIT_FILE_SIZE")
-      return res
-        .status(413)
-        .json({ error: "File too large. Maximum allowed size is 5MB." });
+      return res.status(413).json({ error: "File too large. Max 5MB." });
     console.error("❌ Server error:", err.message);
     res.status(500).json({ error: "Internal server error" });
   });
-});
 
-app.listen(5050, () =>
-  console.log("✅ Backend running on http://localhost:5050")
-);
+  app.listen(5050, () =>
+    console.log("✅ Backend running on http://localhost:5050")
+  );
+});
