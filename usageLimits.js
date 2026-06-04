@@ -28,7 +28,34 @@ export async function initUsageLimits(db) {
   _coll = db.collection("usage_limits");
   _users = db.collection("users");
 
-  // Fast lookups by key+feature.
+  // ── Clean up legacy schema/indexes from earlier versions ──────────────────
+  // An old build created a UNIQUE index `userId_1_feature_1`. This module keys
+  // on `key` (not `userId`), so every doc had userId:null and the 2nd insert
+  // collided. Drop that index and remove the orphaned null rows.
+  try {
+    const indexes = await _coll.indexes();
+    for (const ix of indexes) {
+      // Drop any non-_id index that references a `userId` field (legacy).
+      if (ix.name !== "_id_" && ix.key && ix.key.userId !== undefined) {
+        await _coll.dropIndex(ix.name);
+        console.log(`🧹 Dropped legacy usage_limits index: ${ix.name}`);
+      }
+    }
+  } catch (e) {
+    console.warn("⚠️ usage_limits index cleanup:", e.message);
+  }
+
+  // Remove any orphaned rows from the old schema (keyed by userId, not key).
+  try {
+    const r = await _coll.deleteMany({ key: { $exists: false } });
+    if (r.deletedCount) {
+      console.log(`🧹 Removed ${r.deletedCount} legacy usage_limits rows`);
+    }
+  } catch (e) {
+    console.warn("⚠️ usage_limits row cleanup:", e.message);
+  }
+
+  // Fast lookups by key+feature (NON-unique — multiple windows over time are fine).
   await _coll.createIndex({ key: 1, feature: 1 });
 
   // TTL index: documents auto-delete 24h after windowStart, so counters
@@ -69,12 +96,12 @@ async function isProUser(key) {
  * Atomically consume one unit of the daily quota for (key, feature).
  * Returns { allowed, limit, resetInMinutes, remaining }.
  *
- * Pro users and unknown features are always allowed.
+ * Pro users, unknown features, and missing keys are always allowed.
  */
 export async function consumeDailyQuota(key, feature) {
   const limit = LIMITS[feature];
 
-  // Unknown feature or no key → don't block.
+  // Unknown feature or no key → don't block and don't write anything.
   if (!limit || !key || !_coll) {
     return {
       allowed: true,
