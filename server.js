@@ -26,6 +26,11 @@ import { MongoClient, ObjectId } from "mongodb";
 import admin from "firebase-admin";
 import cron from "node-cron";
 import { initializeBilling } from "./billing/index.js";
+import {
+  initUsageLimits,
+  consumeDailyQuota,
+  refundDailyQuota,
+} from "./usageLimits.js";
 
 if (!process.env.GROQ_API_KEY) {
   console.error("❌ GROQ_API_KEY missing!");
@@ -270,21 +275,6 @@ const GROQ_MODELS = [
   { id: "llama-3.1-8b-instant", MaxCompletionTokens: 8000 },
 ];
 const CONTEXT_EXTRA_TOKENS = 2000;
-const userQuizCounts = new Map();
-const USER_HOURLY_LIMIT = 15;
-
-const checkUserRateLimit = (userId) => {
-  if (!userId) return true;
-  const now = Date.now();
-  const entry = userQuizCounts.get(userId);
-  if (!entry || now - entry.windowStart > 60 * 60 * 1000) {
-    userQuizCounts.set(userId, { count: 1, windowStart: now });
-    return true;
-  }
-  if (entry.count >= USER_HOURLY_LIMIT) return false;
-  entry.count++;
-  return true;
-};
 
 const callGPT52 = async (prompt, hasContext = false) => {
   if (!process.env.OPENAI_API_KEY) return null;
@@ -1385,6 +1375,20 @@ app.post("/chats/:userId", async (req, res) => {
 app.post("/chat", async (req, res) => {
   const { question, history = [], userId, chatId, anonId } = req.body;
   if (!question) return res.status(400).json({ error: "Question is required" });
+
+  // Daily free-tier cap: 10 messages / rolling 24h (Pro users bypass).
+  const chatKey = userId || anonId;
+  const quota = await consumeDailyQuota(chatKey, "chat");
+  if (!quota.allowed) {
+    return res.status(429).json({
+      error: "limit_reached",
+      feature: "chat",
+      limit: quota.limit,
+      resetInMinutes: quota.resetInMinutes,
+      message: `You've used your ${quota.limit} free messages for today.`,
+    });
+  }
+
   try {
     const resolvedUserId = userId || anonId || null;
     const memory = await loadMemory(resolvedUserId);
@@ -1429,6 +1433,8 @@ app.post("/chat", async (req, res) => {
     }
     res.json({ answer });
   } catch (err) {
+    // Don't burn a free message on an AI failure.
+    await refundDailyQuota(chatKey, "chat");
     console.error("❌ Chat error:", err.message);
     res.status(500).json({ error: "AI service failed" });
   }
@@ -1552,10 +1558,23 @@ app.get("/user/:userId/notification-prefs", async (req, res) => {
 
 // ── Quiz generation (with difficulty) ─────────────────────────────────────────
 app.post("/quiz/generate", async (req, res) => {
-  const { topic, count = 10, userId, difficulty = "hard" } = req.body;
-  if (!checkUserRateLimit(userId))
-    return res.status(429).json({ error: "Limit reached" });
+  const { topic, count = 10, userId, anonId, difficulty = "hard" } = req.body;
   if (!topic) return res.status(400).json({ error: "Topic required" });
+
+  // Daily free-tier cap: 3 quizzes / rolling 24h (Pro users bypass).
+  // Counted BEFORE the pooled-quiz lookup so reused quizzes also count.
+  const quizKey = userId || anonId;
+  const quota = await consumeDailyQuota(quizKey, "quiz");
+  if (!quota.allowed) {
+    return res.status(429).json({
+      error: "limit_reached",
+      feature: "quiz",
+      limit: quota.limit,
+      resetInMinutes: quota.resetInMinutes,
+      message: `You've used your ${quota.limit} free quizzes for today.`,
+    });
+  }
+
   const safeCount = Math.min(Math.max(Number(count) || 10, 1), 40);
   const safeDifficulty = ["easy", "medium", "hard"].includes(difficulty)
     ? difficulty
@@ -1584,7 +1603,7 @@ app.post("/quiz/generate", async (req, res) => {
     }
   }
 
-  const prompt = getQuizPrompt("General", topic, safeCount, "", safeDifficulty);
+  const prompt = getQuizPrompt(topic, safeCount, safeDifficulty);
   try {
     const content = await generateAIContent(prompt, false);
     const questions = extractJSONArray(
@@ -1603,6 +1622,8 @@ app.post("/quiz/generate", async (req, res) => {
       reused: false,
     });
   } catch (err) {
+    // Don't burn a free quiz on a generation failure.
+    await refundDailyQuota(quizKey, "quiz");
     console.error("❌ Quiz generation error:", err.message);
     res.status(500).json({ error: "Quiz failed" });
   }
@@ -1657,8 +1678,19 @@ app.get("/current-affairs-quiz", async (req, res) => {
 });
 
 // ── Quiz Result ───────────────────────────────────────────────────────────────
+// ── Quiz Result ───────────────────────────────────────────────────────────────
 app.post("/quiz/result", async (req, res) => {
-  const { userId, topic, score, total, timeTaken, quizId } = req.body;
+  const {
+    userId,
+    topic,
+    score,
+    total,
+    timeTaken,
+    quizId,
+    questions,
+    answers,
+    difficulty,
+  } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   try {
     const user = await getUsers().findOne({ userId });
@@ -1687,15 +1719,33 @@ app.post("/quiz/result", async (req, res) => {
       },
       { upsert: true }
     );
+
+    // Build a compact, capped review payload so docs don't balloon.
+    let reviewQuestions = null;
+    if (Array.isArray(questions) && questions.length) {
+      const answerArr = Array.isArray(answers) ? answers : [];
+      reviewQuestions = questions.slice(0, 40).map((q, i) => ({
+        question: String(q.question || "").slice(0, 600),
+        options: Array.isArray(q.options)
+          ? q.options.map((o) => String(o).slice(0, 200))
+          : [],
+        correct: typeof q.correct === "number" ? q.correct : -1,
+        selected: typeof answerArr[i] === "number" ? answerArr[i] : -1,
+        explanation: String(q.explanation || "").slice(0, 600),
+      }));
+    }
+
     await getQuizResults().insertOne({
       userId,
       topic,
+      difficulty: difficulty || null,
       score,
       total,
       percentage: Math.round((score / total) * 100),
       timeTaken,
       coinsEarned,
       quizId: quizId ? new ObjectId(quizId) : null,
+      reviewQuestions, // null for old/light submissions
       createdAt: new Date(),
     });
     const updatedUser = await getUsers().findOne({ userId });
@@ -2047,6 +2097,10 @@ connectDB().then(async () => {
   const billing = await initializeBilling({ db });
   app.use("/billing", billing.router);
 
+  // Daily free-tier usage caps — Pro users bypass. Reads users.isPro (kept
+  // fresh by billing webhooks + the daily expiry cron).
+  await initUsageLimits(db);
+
   // Flashcards module
   const flashcards = initializeFlashcards({
     db,
@@ -2111,9 +2165,6 @@ connectDB().then(async () => {
     for (const [key, val] of searchCache.entries()) {
       if (now - val.timestamp > SEARCH_CACHE_DURATION) searchCache.delete(key);
     }
-    for (const [key, val] of userQuizCounts.entries()) {
-      if (now - val.windowStart > 60 * 60 * 1000) userQuizCounts.delete(key);
-    }
   }, 60 * 60 * 1000);
 
   setInterval(() => {
@@ -2121,7 +2172,6 @@ connectDB().then(async () => {
     console.log(`🧠 Memory: ${mb}MB`);
     if (mb > 400) {
       searchCache.clear();
-      userQuizCounts.clear();
     }
   }, 5 * 60 * 1000);
 
