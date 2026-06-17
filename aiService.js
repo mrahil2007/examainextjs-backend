@@ -2,8 +2,9 @@ import dotenv from "dotenv";
 dotenv.config();
 
 // ── aiService.js ──────────────────────────────────────────────────────────────
-// PRIMARY:  gemini-2.5-flash (rotating keys)
-// FALLBACK: Groq Llama / GPT-OSS (free tier) → Cerebras
+// PRIMARY:  gemini-3.5-flash (chat/vision) + gemini-3.1-flash-lite (routing/bulk)
+//           both Stable, with rotating keys across 3 projects
+// FALLBACK: 3.5-flash → 3.1-flash-lite → Groq → Cerebras
 //
 // Universal tutor — understands competitive exams and academic subjects worldwide.
 // No exam selection required. Adapts to whatever the user asks.
@@ -27,6 +28,19 @@ const getNextGeminiKey = () => {
   keyIndex++;
   return key;
 };
+
+// ── MODEL SELECTION (Gemini 3.x — both Stable as of June 2026) ────────────────
+// Chat + vision use the smarter 3.5 Flash; routing + bulk generation use the
+// cheaper, faster 3.1 Flash-Lite. If 3.5 Flash fails across all keys, chat
+// drops to 3.1 Flash-Lite (still Gemini) before falling back to Groq.
+const MODEL_CHAT = "gemini-3.5-flash";
+const MODEL_CHAT_FALLBACK = "gemini-3.1-flash-lite";
+const MODEL_LITE = "gemini-3.1-flash-lite";
+
+// Gemini 3.x replaced 2.5's `thinkingBudget` with `thinkingLevel`
+// (values: "minimal" | "low" | "medium" | "high"). You cannot send both.
+const THINK_CHAT = "low"; // strong quality, fast/cheap for tutor chat
+const THINK_LITE = "minimal"; // classification/bulk — fastest
 
 // ── IDENTITY PROTECTION ───────────────────────────────────────────────────────
 const IDENTITY_RULE = `CRITICAL IDENTITY RULES (HIGHEST PRIORITY — OVERRIDE EVERYTHING ELSE):
@@ -166,7 +180,13 @@ const getSystemPrompt = (isQuiz = false, memory = []) => {
 // network error) now advances to the NEXT key. We only give up and let the
 // caller fall through to Groq AFTER all keys have genuinely failed. Previously
 // a non-429 error threw immediately and skipped keys 2 and 3.
-const callGemini = async (contents, isVision = false, memory = []) => {
+const callGemini = async (
+  contents,
+  isVision = false,
+  memory = [],
+  model = MODEL_CHAT,
+  thinkingLevel = THINK_CHAT
+) => {
   if (!GEMINI_KEYS.length) throw new Error("No Gemini API keys configured");
 
   let lastError = null;
@@ -176,7 +196,7 @@ const callGemini = async (contents, isVision = false, memory = []) => {
 
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -190,7 +210,7 @@ const callGemini = async (contents, isVision = false, memory = []) => {
               maxOutputTokens: 8192,
               topP: 0.95,
               thinkingConfig: {
-                thinkingBudget: 1024,
+                thinkingLevel,
               },
             },
             safetySettings: [
@@ -222,7 +242,7 @@ const callGemini = async (contents, isVision = false, memory = []) => {
           detail = err?.error?.message || detail;
         } catch {}
         console.warn(
-          `⚠️ Gemini key ${attempt + 1}/${GEMINI_KEYS.length} failed (${
+          `⚠️ ${model} key ${attempt + 1}/${GEMINI_KEYS.length} failed (${
             response.status
           }): ${detail} → trying next key`
         );
@@ -234,7 +254,7 @@ const callGemini = async (contents, isVision = false, memory = []) => {
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
       if (!text) {
         console.warn(
-          `⚠️ Gemini key ${attempt + 1}/${
+          `⚠️ ${model} key ${attempt + 1}/${
             GEMINI_KEYS.length
           } returned empty → trying next key`
         );
@@ -243,15 +263,13 @@ const callGemini = async (contents, isVision = false, memory = []) => {
       }
 
       console.log(
-        `✅ gemini-2.5-flash answered using key ${attempt + 1} of ${
-          GEMINI_KEYS.length
-        }`
+        `✅ ${model} answered using key ${attempt + 1} of ${GEMINI_KEYS.length}`
       );
       return text;
     } catch (err) {
       // Network/transient error on this key — try the next key, don't bail.
       console.warn(
-        `⚠️ Gemini key ${attempt + 1}/${GEMINI_KEYS.length} threw: ${
+        `⚠️ ${model} key ${attempt + 1}/${GEMINI_KEYS.length} threw: ${
           err.message
         } → trying next key`
       );
@@ -477,11 +495,32 @@ export const askAI = async (
     { role: "user", parts: [{ text: prompt }] },
   ];
 
-  // 1️⃣ Try Gemini 2.5 Flash (rotates through ALL keys before giving up)
+  // 1️⃣ Try Gemini 3.5 Flash (rotates through ALL keys before giving up)
   try {
-    return await callGemini(contents, false, memory);
+    return await callGemini(contents, false, memory, MODEL_CHAT, THINK_CHAT);
   } catch (err) {
-    console.warn("⚠️ Gemini failed:", err.message, "→ falling back to Groq");
+    console.warn(
+      `⚠️ ${MODEL_CHAT} failed:`,
+      err.message,
+      `→ trying ${MODEL_CHAT_FALLBACK}`
+    );
+  }
+
+  // 1️⃣b Stay inside Gemini — try 3.1 Flash-Lite before leaving for Groq
+  try {
+    return await callGemini(
+      contents,
+      false,
+      memory,
+      MODEL_CHAT_FALLBACK,
+      THINK_LITE
+    );
+  } catch (err) {
+    console.warn(
+      `⚠️ ${MODEL_CHAT_FALLBACK} failed:`,
+      err.message,
+      "→ falling back to Groq"
+    );
   }
 
   // 2️⃣ Fallback to Groq (receives full history + memory for continuity)
@@ -519,14 +558,33 @@ export const askAIWithImage = async (fileBuffer, mimeType, userPrompt = "") => {
     },
   ];
 
-  // 1️⃣ Try Gemini Vision first (rotates through ALL keys before giving up)
+  // 1️⃣ Try Gemini 3.5 Flash Vision (rotates through ALL keys)
   try {
-    const answer = await callGemini(contents, true);
-    console.log("✅ Image/PDF analyzed by gemini-2.5-flash Vision");
+    const answer = await callGemini(contents, true, [], MODEL_CHAT, THINK_CHAT);
+    console.log(`✅ Image/PDF analyzed by ${MODEL_CHAT} Vision`);
     return answer;
   } catch (err) {
     console.warn(
-      "⚠️ Gemini Vision failed:",
+      `⚠️ ${MODEL_CHAT} Vision failed:`,
+      err.message,
+      `→ trying ${MODEL_CHAT_FALLBACK} Vision`
+    );
+  }
+
+  // 1️⃣b Stay inside Gemini — try 3.1 Flash-Lite Vision before Groq Vision
+  try {
+    const answer = await callGemini(
+      contents,
+      true,
+      [],
+      MODEL_CHAT_FALLBACK,
+      THINK_LITE
+    );
+    console.log(`✅ Image/PDF analyzed by ${MODEL_CHAT_FALLBACK} Vision`);
+    return answer;
+  } catch (err) {
+    console.warn(
+      `⚠️ ${MODEL_CHAT_FALLBACK} Vision failed:`,
       err.message,
       "→ falling back to Groq Vision"
     );
@@ -695,7 +753,7 @@ export const askAIAgent = async (question) => {
 
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_LITE}:generateContent?key=${key}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -717,7 +775,11 @@ Do NOT answer the question yourself. Just pick the right tool.`,
             contents: [{ role: "user", parts: [{ text: question }] }],
             tools: [{ function_declarations: AGENT_TOOLS }],
             tool_config: { function_calling_config: { mode: "ANY" } },
-            generationConfig: { temperature: 0.1, maxOutputTokens: 256 },
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 256,
+              thinkingConfig: { thinkingLevel: THINK_LITE },
+            },
           }),
         }
       );
@@ -731,9 +793,9 @@ Do NOT answer the question yourself. Just pick the right tool.`,
           detail = err?.error?.message || detail;
         } catch {}
         console.warn(
-          `⚠️ Agent key ${attempt + 1}/${GEMINI_KEYS.length} failed (${
-            response.status
-          }): ${detail} → trying next key`
+          `⚠️ ${MODEL_LITE} (agent) key ${attempt + 1}/${
+            GEMINI_KEYS.length
+          } failed (${response.status}): ${detail} → trying next key`
         );
         continue;
       }
@@ -757,9 +819,9 @@ Do NOT answer the question yourself. Just pick the right tool.`,
       return { action: "direct" };
     } catch (err) {
       console.warn(
-        `⚠️ Agent key ${attempt + 1}/${GEMINI_KEYS.length} threw: ${
-          err.message
-        } → trying next key`
+        `⚠️ ${MODEL_LITE} (agent) key ${attempt + 1}/${
+          GEMINI_KEYS.length
+        } threw: ${err.message} → trying next key`
       );
       continue;
     }
@@ -780,7 +842,7 @@ export const callGeminiOnce = async (prompt, maxTokens = 2000) => {
     const key = getNextGeminiKey();
     try {
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_LITE}:generateContent?key=${key}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -790,6 +852,7 @@ export const callGeminiOnce = async (prompt, maxTokens = 2000) => {
               temperature: 0.7,
               maxOutputTokens: maxTokens,
               topP: 0.95,
+              thinkingConfig: { thinkingLevel: THINK_LITE },
             },
             safetySettings: [
               { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
@@ -813,9 +876,9 @@ export const callGeminiOnce = async (prompt, maxTokens = 2000) => {
           detail = err?.error?.message || detail;
         } catch {}
         console.warn(
-          `⚠️ callGeminiOnce key ${attempt + 1}/${GEMINI_KEYS.length} failed (${
-            response.status
-          }): ${detail} → next key`
+          `⚠️ ${MODEL_LITE} (once) key ${attempt + 1}/${
+            GEMINI_KEYS.length
+          } failed (${response.status}): ${detail} → next key`
         );
         lastError = new Error(detail);
         continue;
@@ -826,7 +889,7 @@ export const callGeminiOnce = async (prompt, maxTokens = 2000) => {
       if (text) return text;
 
       console.warn(
-        `⚠️ callGeminiOnce key ${attempt + 1}/${
+        `⚠️ ${MODEL_LITE} (once) key ${attempt + 1}/${
           GEMINI_KEYS.length
         } empty → next key`
       );
@@ -834,9 +897,9 @@ export const callGeminiOnce = async (prompt, maxTokens = 2000) => {
       continue;
     } catch (err) {
       console.warn(
-        `⚠️ callGeminiOnce key ${attempt + 1}/${GEMINI_KEYS.length} threw: ${
-          err.message
-        } → next key`
+        `⚠️ ${MODEL_LITE} (once) key ${attempt + 1}/${
+          GEMINI_KEYS.length
+        } threw: ${err.message} → next key`
       );
       lastError = err;
       continue;
