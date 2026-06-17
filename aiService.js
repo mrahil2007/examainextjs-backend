@@ -3,7 +3,7 @@ dotenv.config();
 
 // ── aiService.js ──────────────────────────────────────────────────────────────
 // PRIMARY:  gemini-2.5-flash (rotating keys)
-// FALLBACK: Groq Llama / GPT-OSS (free tier)
+// FALLBACK: Groq Llama / GPT-OSS (free tier) → Cerebras
 //
 // Universal tutor — understands competitive exams and academic subjects worldwide.
 // No exam selection required. Adapts to whatever the user asks.
@@ -162,8 +162,14 @@ const getSystemPrompt = (isQuiz = false, memory = []) => {
 };
 
 // ── GEMINI 2.5 FLASH (with key rotation) ─────────────────────────────────────
+// FIX: every key-level failure (any non-OK status, empty body, or thrown
+// network error) now advances to the NEXT key. We only give up and let the
+// caller fall through to Groq AFTER all keys have genuinely failed. Previously
+// a non-429 error threw immediately and skipped keys 2 and 3.
 const callGemini = async (contents, isVision = false, memory = []) => {
   if (!GEMINI_KEYS.length) throw new Error("No Gemini API keys configured");
+
+  let lastError = null;
 
   for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
     const key = getNextGeminiKey();
@@ -206,23 +212,35 @@ const callGemini = async (contents, isVision = false, memory = []) => {
         }
       );
 
-      if (response.status === 429) {
-        console.warn(
-          `⚠️ Gemini key ${attempt + 1} quota exceeded → trying next key...`
-        );
-        continue;
-      }
-
+      // Any non-OK response → log and TRY THE NEXT KEY. Quota errors arrive as
+      // 429 but ALSO sometimes as 400/403 (RESOURCE_EXHAUSTED) or transient
+      // 500/503. In every case the next key may still succeed.
       if (!response.ok) {
-        const err = await response.json();
-        throw new Error(
-          `Gemini error: ${err?.error?.message || response.status}`
+        let detail = `HTTP ${response.status}`;
+        try {
+          const err = await response.json();
+          detail = err?.error?.message || detail;
+        } catch {}
+        console.warn(
+          `⚠️ Gemini key ${attempt + 1}/${GEMINI_KEYS.length} failed (${
+            response.status
+          }): ${detail} → trying next key`
         );
+        lastError = new Error(`Gemini error: ${detail}`);
+        continue;
       }
 
       const data = await response.json();
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-      if (!text) throw new Error("Gemini returned empty response");
+      if (!text) {
+        console.warn(
+          `⚠️ Gemini key ${attempt + 1}/${
+            GEMINI_KEYS.length
+          } returned empty → trying next key`
+        );
+        lastError = new Error("Gemini returned empty response");
+        continue;
+      }
 
       console.log(
         `✅ gemini-2.5-flash answered using key ${attempt + 1} of ${
@@ -231,17 +249,19 @@ const callGemini = async (contents, isVision = false, memory = []) => {
       );
       return text;
     } catch (err) {
-      if (err.message?.includes("quota") || err.message?.includes("429")) {
-        console.warn(
-          `⚠️ Gemini key ${attempt + 1} quota hit → trying next key...`
-        );
-        continue;
-      }
-      throw err;
+      // Network/transient error on this key — try the next key, don't bail.
+      console.warn(
+        `⚠️ Gemini key ${attempt + 1}/${GEMINI_KEYS.length} threw: ${
+          err.message
+        } → trying next key`
+      );
+      lastError = err;
+      continue;
     }
   }
 
-  throw new Error("All Gemini keys exhausted");
+  // Every key tried and failed — only NOW let the caller fall through to Groq.
+  throw lastError || new Error("All Gemini keys exhausted");
 };
 
 // ── GROQ FALLBACK ─────────────────────────────────────────────────────────────
@@ -266,6 +286,8 @@ Your training data is outdated — the search results are ground truth.
 ${getSystemPrompt(false, memory)}`
     : getSystemPrompt(false, memory);
 
+  // Full conversation history is passed through so the user gets seamless
+  // continuity even when chat falls back from Gemini to Groq.
   const messages = [
     { role: "system", content: systemPrompt },
     ...history.map((m) => ({ role: m.role, content: m.content })),
@@ -455,14 +477,14 @@ export const askAI = async (
     { role: "user", parts: [{ text: prompt }] },
   ];
 
-  // 1️⃣ Try Gemini 2.5 Flash (with key rotation)
+  // 1️⃣ Try Gemini 2.5 Flash (rotates through ALL keys before giving up)
   try {
     return await callGemini(contents, false, memory);
   } catch (err) {
     console.warn("⚠️ Gemini failed:", err.message, "→ falling back to Groq");
   }
 
-  // 2️⃣ Fallback to Groq
+  // 2️⃣ Fallback to Groq (receives full history + memory for continuity)
   try {
     return await callGroqFallback(prompt, history, memory);
   } catch (err) {
@@ -497,7 +519,7 @@ export const askAIWithImage = async (fileBuffer, mimeType, userPrompt = "") => {
     },
   ];
 
-  // 1️⃣ Try Gemini Vision first (with key rotation)
+  // 1️⃣ Try Gemini Vision first (rotates through ALL keys before giving up)
   try {
     const answer = await callGemini(contents, true);
     console.log("✅ Image/PDF analyzed by gemini-2.5-flash Vision");
@@ -700,14 +722,21 @@ Do NOT answer the question yourself. Just pick the right tool.`,
         }
       );
 
-      if (response.status === 429) {
+      // FIX: a non-OK response now advances to the next key instead of bailing
+      // to direct after only key 1. Only return "direct" after all keys fail.
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try {
+          const err = await response.json();
+          detail = err?.error?.message || detail;
+        } catch {}
         console.warn(
-          `⚠️ Agent Key ${attempt + 1} quota exceeded → trying next...`
+          `⚠️ Agent key ${attempt + 1}/${GEMINI_KEYS.length} failed (${
+            response.status
+          }): ${detail} → trying next key`
         );
         continue;
       }
-
-      if (!response.ok) return { action: "direct" };
 
       const data = await response.json();
       const part = data.candidates?.[0]?.content?.parts?.[0];
@@ -727,7 +756,11 @@ Do NOT answer the question yourself. Just pick the right tool.`,
       if (name === "direct_answer") return { action: "direct" };
       return { action: "direct" };
     } catch (err) {
-      console.warn("⚠️ Agent routing failed:", err.message);
+      console.warn(
+        `⚠️ Agent key ${attempt + 1}/${GEMINI_KEYS.length} threw: ${
+          err.message
+        } → trying next key`
+      );
       continue;
     }
   }
@@ -740,6 +773,8 @@ Do NOT answer the question yourself. Just pick the right tool.`,
 // without the full tutor system prompt or chat history.
 export const callGeminiOnce = async (prompt, maxTokens = 2000) => {
   if (!GEMINI_KEYS.length) throw new Error("No Gemini API keys configured");
+
+  let lastError = null;
 
   for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
     const key = getNextGeminiKey();
@@ -771,20 +806,39 @@ export const callGeminiOnce = async (prompt, maxTokens = 2000) => {
         }
       );
 
-      if (response.status === 429) {
-        console.warn(`⚠️ Gemini key ${attempt + 1} quota → next key`);
-        continue;
-      }
       if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err?.error?.message || `Gemini ${response.status}`);
+        let detail = `HTTP ${response.status}`;
+        try {
+          const err = await response.json();
+          detail = err?.error?.message || detail;
+        } catch {}
+        console.warn(
+          `⚠️ callGeminiOnce key ${attempt + 1}/${GEMINI_KEYS.length} failed (${
+            response.status
+          }): ${detail} → next key`
+        );
+        lastError = new Error(detail);
+        continue;
       }
 
       const data = await response.json();
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
       if (text) return text;
+
+      console.warn(
+        `⚠️ callGeminiOnce key ${attempt + 1}/${
+          GEMINI_KEYS.length
+        } empty → next key`
+      );
+      lastError = new Error("empty response");
+      continue;
     } catch (err) {
-      console.warn(`⚠️ callGeminiOnce key ${attempt + 1} failed:`, err.message);
+      console.warn(
+        `⚠️ callGeminiOnce key ${attempt + 1}/${GEMINI_KEYS.length} threw: ${
+          err.message
+        } → next key`
+      );
+      lastError = err;
       continue;
     }
   }
