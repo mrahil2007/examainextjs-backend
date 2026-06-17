@@ -2,9 +2,10 @@ import dotenv from "dotenv";
 dotenv.config();
 
 // ── aiService.js ──────────────────────────────────────────────────────────────
-// PRIMARY:  gemini-3.5-flash (chat/vision) + gemini-3.1-flash-lite (routing/bulk)
-//           both Stable, with rotating keys across 3 projects
-// FALLBACK: 3.5-flash → 3.1-flash-lite → Groq → Cerebras
+// PRIMARY:  gemini-3.1-flash-lite (chat, vision, routing, bulk) — Stable, free,
+//           benchmarks above old 2.5 Flash, and avoids 3.5 Flash's 503 outages.
+//           Rotating keys across 3 projects.
+// FALLBACK: gemini-3.1-flash-lite → Groq → Cerebras
 //
 // Universal tutor — understands competitive exams and academic subjects worldwide.
 // No exam selection required. Adapts to whatever the user asks.
@@ -29,18 +30,25 @@ const getNextGeminiKey = () => {
   return key;
 };
 
-// ── MODEL SELECTION (Gemini 3.x — both Stable as of June 2026) ────────────────
-// Chat + vision use the smarter 3.5 Flash; routing + bulk generation use the
-// cheaper, faster 3.1 Flash-Lite. If 3.5 Flash fails across all keys, chat
-// drops to 3.1 Flash-Lite (still Gemini) before falling back to Groq.
-const MODEL_CHAT = "gemini-3.5-flash";
-const MODEL_CHAT_FALLBACK = "gemini-3.1-flash-lite";
+// ── MODEL SELECTION (Gemini 3.x — Stable as of June 2026) ─────────────────────
+// gemini-3.1-flash-lite is the primary for everything: it benchmarks ABOVE the
+// old 2.5 Flash (2.5x faster first token, +45% output speed, higher reasoning
+// scores) and — critically — does NOT suffer the constant 503 "high demand"
+// outages that 3.5 Flash hits on free tier. It handles chat, vision, PDF,
+// function-calling (routing), and bulk generation. Stable, free, 1500 RPD/key.
+//
+// gemini-3.5-flash is kept ONLY as an optional higher-quality primary you can
+// flip back to later if Google's free-tier capacity for it improves. Right now
+// it 503s too often to be the primary, so it is not in the active path.
+const MODEL_CHAT = "gemini-3.1-flash-lite";
 const MODEL_LITE = "gemini-3.1-flash-lite";
 
 // Gemini 3.x replaced 2.5's `thinkingBudget` with `thinkingLevel`
 // (values: "minimal" | "low" | "medium" | "high"). You cannot send both.
-const THINK_CHAT = "low"; // strong quality, fast/cheap for tutor chat
-const THINK_LITE = "minimal"; // classification/bulk — fastest
+// "low" gives a light reasoning pass — good quality for a tutor while staying
+// fast/cheap. Bump to "medium" if hard-MCQ answers ever feel shallow.
+const THINK_CHAT = "low"; // tutor chat + vision
+const THINK_LITE = "minimal"; // routing + bulk generation — fastest
 
 // ── IDENTITY PROTECTION ───────────────────────────────────────────────────────
 const IDENTITY_RULE = `CRITICAL IDENTITY RULES (HIGHEST PRIORITY — OVERRIDE EVERYTHING ELSE):
@@ -495,29 +503,12 @@ export const askAI = async (
     { role: "user", parts: [{ text: prompt }] },
   ];
 
-  // 1️⃣ Try Gemini 3.5 Flash (rotates through ALL keys before giving up)
+  // 1️⃣ Try Gemini 3.1 Flash-Lite (rotates through ALL keys before giving up)
   try {
     return await callGemini(contents, false, memory, MODEL_CHAT, THINK_CHAT);
   } catch (err) {
     console.warn(
       `⚠️ ${MODEL_CHAT} failed:`,
-      err.message,
-      `→ trying ${MODEL_CHAT_FALLBACK}`
-    );
-  }
-
-  // 1️⃣b Stay inside Gemini — try 3.1 Flash-Lite before leaving for Groq
-  try {
-    return await callGemini(
-      contents,
-      false,
-      memory,
-      MODEL_CHAT_FALLBACK,
-      THINK_LITE
-    );
-  } catch (err) {
-    console.warn(
-      `⚠️ ${MODEL_CHAT_FALLBACK} failed:`,
       err.message,
       "→ falling back to Groq"
     );
@@ -558,7 +549,7 @@ export const askAIWithImage = async (fileBuffer, mimeType, userPrompt = "") => {
     },
   ];
 
-  // 1️⃣ Try Gemini 3.5 Flash Vision (rotates through ALL keys)
+  // 1️⃣ Try Gemini 3.1 Flash-Lite Vision (rotates through ALL keys)
   try {
     const answer = await callGemini(contents, true, [], MODEL_CHAT, THINK_CHAT);
     console.log(`✅ Image/PDF analyzed by ${MODEL_CHAT} Vision`);
@@ -566,25 +557,6 @@ export const askAIWithImage = async (fileBuffer, mimeType, userPrompt = "") => {
   } catch (err) {
     console.warn(
       `⚠️ ${MODEL_CHAT} Vision failed:`,
-      err.message,
-      `→ trying ${MODEL_CHAT_FALLBACK} Vision`
-    );
-  }
-
-  // 1️⃣b Stay inside Gemini — try 3.1 Flash-Lite Vision before Groq Vision
-  try {
-    const answer = await callGemini(
-      contents,
-      true,
-      [],
-      MODEL_CHAT_FALLBACK,
-      THINK_LITE
-    );
-    console.log(`✅ Image/PDF analyzed by ${MODEL_CHAT_FALLBACK} Vision`);
-    return answer;
-  } catch (err) {
-    console.warn(
-      `⚠️ ${MODEL_CHAT_FALLBACK} Vision failed:`,
       err.message,
       "→ falling back to Groq Vision"
     );
