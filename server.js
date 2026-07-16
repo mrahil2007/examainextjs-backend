@@ -1404,6 +1404,17 @@ app.post("/chat", async (req, res) => {
       const ctx = await fetchLiveSearchContext(decision.query);
       if (ctx) finalPrompt = `${ctx}\n\nQuestion: ${question}`;
     }
+    // Check if any message in history has extractedText (PDF was uploaded earlier)
+    const pdfContext = history
+      .filter((m) => m.extractedText)
+      .map((m) => m.extractedText)
+      .join("\n\n")
+      .slice(0, 12000);
+
+    if (pdfContext) {
+      finalPrompt = `[Document context from uploaded PDF]\n${pdfContext}\n\nQuestion: ${finalPrompt}`;
+    }
+
     const answer = await askAI(finalPrompt, history, false, memory);
     if (chatId && (userId || anonId)) {
       await getChats().updateOne(
@@ -1894,6 +1905,7 @@ app.post("/image/edit", upload.single("image"), async (req, res) => {
 });
 
 // ── Image / PDF upload — vision analysis or PDF text extraction ──────────────
+// ── Image / PDF upload — vision analysis or PDF text extraction ──────────────
 app.post("/image", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "File required" });
@@ -1903,7 +1915,6 @@ app.post("/image", upload.single("image"), async (req, res) => {
       typeof req.body.prompt === "string" ? req.body.prompt.trim() : "";
     const memory = userId ? await loadMemory(userId) : [];
 
-    // PDF flow — extract text first, then ask AI tutor
     if (req.file.mimetype === "application/pdf") {
       try {
         const { text } = await extractText(req.file.buffer);
@@ -1923,11 +1934,9 @@ app.post("/image", upload.single("image"), async (req, res) => {
         }
       } catch (err) {
         console.warn("⚠️ PDF text extraction failed:", err.message);
-        // fall through to vision
       }
     }
 
-    // Image flow — pass user prompt to vision model
     const answer = await askAIWithImage(
       req.file.buffer,
       req.file.mimetype,
@@ -1938,6 +1947,87 @@ app.post("/image", upload.single("image"), async (req, res) => {
   } catch (err) {
     console.error("❌ /image error:", err.message);
     res.status(500).json({ error: "Image processing failed" });
+  }
+});
+
+// ── Chat with file upload — saves to MongoDB ──────────────────────────────────
+app.post("/chat/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "File required" });
+
+    const { userId, anonId, chatId, prompt = "" } = req.body;
+    const resolvedUserId = userId || anonId || null;
+
+    const chatKey = resolvedUserId || "guest_upload";
+    const quota = await consumeDailyQuota(chatKey, "chat");
+    if (!quota.allowed) {
+      return res.status(429).json({
+        error: "limit_reached",
+        feature: "chat",
+        limit: quota.limit,
+        resetInMinutes: quota.resetInMinutes,
+      });
+    }
+
+    const memory = resolvedUserId ? await loadMemory(resolvedUserId) : [];
+    let answer;
+    let userMessageContent = prompt || "Analyze this file.";
+    let extractedPdfText = null; // ← captured here for MongoDB
+
+    if (req.file.mimetype === "application/pdf") {
+      try {
+        const { text } = await extractText(req.file.buffer);
+        if (text && text.trim().length > 50) {
+          extractedPdfText = text.slice(0, 12000); // ← save it
+          const combined = prompt
+            ? `${prompt}\n\n[PDF content]\n${extractedPdfText}`
+            : `Analyze this document. Extract key concepts and explain them.\n\n[PDF content]\n${extractedPdfText}`;
+          answer = await askAI(combined, [], false, memory);
+          userMessageContent = prompt
+            ? `${prompt} [PDF attached]`
+            : "[PDF attached] Analyze this document.";
+        }
+      } catch (err) {
+        console.warn("⚠️ PDF extraction failed:", err.message);
+      }
+    }
+
+    if (!answer) {
+      answer = await askAIWithImage(req.file.buffer, req.file.mimetype, prompt);
+      userMessageContent = prompt
+        ? `${prompt} [Image attached]`
+        : "[Image attached]";
+    }
+
+    req.file.buffer = null;
+
+    if (chatId && resolvedUserId) {
+      await getChats().updateOne(
+        { _id: new ObjectId(chatId), userId: resolvedUserId },
+        {
+          $push: {
+            messages: {
+              $each: [
+                {
+                  role: "user",
+                  content: userMessageContent,
+                  timestamp: new Date(),
+                  // save extracted text so follow-up questions have context
+                  extractedText: extractedPdfText || null,
+                },
+                { role: "assistant", content: answer, timestamp: new Date() },
+              ],
+            },
+          },
+          $set: { updatedAt: new Date() },
+        }
+      );
+    }
+
+    res.json({ answer });
+  } catch (err) {
+    console.error("❌ /chat/upload error:", err.message);
+    res.status(500).json({ error: "File processing failed" });
   }
 });
 
