@@ -1417,6 +1417,15 @@ app.post("/chat", async (req, res) => {
 
     const answer = await askAI(finalPrompt, history, false, memory);
     if (chatId && (userId || anonId)) {
+      const existingChat = await getChats().findOne(
+        { _id: new ObjectId(chatId), userId: userId || anonId },
+        { projection: { messages: 1, title: 1 } }
+      );
+      const isFirstMessage = !existingChat?.messages?.length;
+      const autoTitle = isFirstMessage
+        ? question.slice(0, 40).trim()
+        : existingChat?.title || "New Chat";
+
       await getChats().updateOne(
         { _id: new ObjectId(chatId), userId: userId || anonId },
         {
@@ -1428,7 +1437,7 @@ app.post("/chat", async (req, res) => {
               ],
             },
           },
-          $set: { updatedAt: new Date() },
+          $set: { updatedAt: new Date(), title: autoTitle },
         }
       );
     }
@@ -2002,6 +2011,22 @@ app.post("/chat/upload", upload.single("file"), async (req, res) => {
     req.file.buffer = null;
 
     if (chatId && resolvedUserId) {
+      const existingUploadChat = await getChats().findOne(
+        { _id: new ObjectId(chatId), userId: resolvedUserId },
+        { projection: { messages: 1, title: 1 } }
+      );
+      const isFirstUpload = !existingUploadChat?.messages?.length;
+      const uploadTitle = isFirstUpload
+        ? (
+            prompt ||
+            (req.file.mimetype === "application/pdf"
+              ? "PDF analysis"
+              : "Image analysis")
+          )
+            .slice(0, 40)
+            .trim()
+        : existingUploadChat?.title || "New Chat";
+
       await getChats().updateOne(
         { _id: new ObjectId(chatId), userId: resolvedUserId },
         {
@@ -2019,7 +2044,7 @@ app.post("/chat/upload", upload.single("file"), async (req, res) => {
               ],
             },
           },
-          $set: { updatedAt: new Date() },
+          $set: { updatedAt: new Date(), title: uploadTitle },
         }
       );
     }
